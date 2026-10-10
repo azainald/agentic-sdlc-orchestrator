@@ -1,0 +1,15 @@
+.git
+.github
+.venv
+.pytest_cache
+__pycache__
+*.pyc
+*.egg-info
+.env
+*.pdf
+Dockerfile
+.dockerignore
+docker-compose.yml
+docs/generated
+data/*
+!data/.gitkeep

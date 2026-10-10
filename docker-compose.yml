@@ -1,0 +1,29 @@
+# NOTE: `python -m shortener` and `python -m orchestrator` currently hard-code
+# host="127.0.0.1", so the published ports are NOT reachable from the host until
+# each __main__.py binds 0.0.0.0 (e.g. host=os.environ.get("HOST", "127.0.0.1")).
+# HOST/PORT are set below so the services work as soon as that change is made.
+services:
+  shortener:
+    build: .
+    image: agentic-sdlc-orchestrator
+    command: ["python", "-m", "shortener"]
+    environment:
+      HOST: "0.0.0.0"
+      PORT: "8080"
+      SHORTENER_DATA_FILE: /app/data/shortener.json
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./data:/app/data
+
+  orchestrator:
+    build: .
+    image: agentic-sdlc-orchestrator
+    command: ["python", "-m", "orchestrator"]
+    environment:
+      HOST: "0.0.0.0"
+      PORT: "8090"
+    ports:
+      - "8090:8090"
+    volumes:
+      - ./data:/app/data

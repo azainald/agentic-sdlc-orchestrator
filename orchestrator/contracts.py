@@ -34,7 +34,8 @@ class TelemetrySink(Protocol):
 
     def run_finished(self, run: Run) -> None:
         """Called once when a run reaches a terminal state. Records success/
-        failure, retries, rollbacks, e2e latency and (for failed runs) MTTR."""
+        failure, retries, rollbacks, e2e latency and MTTR (approximated for runs
+        that succeeded after a retry, fallback or rollback; see telemetry.py)."""
         ...
 
     def events_for(self, run_id: str) -> list[dict[str, Any]]: ...
