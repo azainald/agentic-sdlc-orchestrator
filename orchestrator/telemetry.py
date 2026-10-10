@@ -50,6 +50,7 @@ class Telemetry:
         self._totals = {"retries": 0, "fallbacks": 0, "rollbacks": 0,
                         "approvals_requested": 0, "replans": 0}
         self._latencies_ms: list[float] = []
+        self._active_ms: list[float] = []  # e2e latency minus time spent waiting for humans
         self._mttr_ms: list[float] = []
 
     # ---- events ---------------------------------------------------------
@@ -89,6 +90,8 @@ class Telemetry:
                 latency = (now() - started) * 1000
             if latency is not None:
                 self._latencies_ms.append(latency)
+            if m.active_ms is not None:
+                self._active_ms.append(m.active_ms)
 
             if run.state is RunState.SUCCEEDED and m.ended_at is not None:
                 first = next((d.ts for d in run.decisions if d.kind in RECOVERY_KINDS), None)
@@ -118,6 +121,7 @@ class Telemetry:
                 "approvals_requested_total": t["approvals_requested"],
                 "mttr_ms": _ratio(sum(self._mttr_ms), len(self._mttr_ms)),
                 "avg_e2e_latency_ms": _ratio(sum(lat), len(lat)),
+                "avg_active_ms": _ratio(sum(self._active_ms), len(self._active_ms)),
                 "p95_e2e_latency_ms": _percentile(lat, 95),
                 "generated_at": now(),
             }

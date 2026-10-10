@@ -9,10 +9,11 @@ from __future__ import annotations
 import hashlib
 import json
 import time
+from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Callable, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 def now() -> float:
@@ -77,6 +78,20 @@ class ApprovalStatus(str, Enum):
     REJECTED = "rejected"
 
 
+@dataclass(frozen=True)
+class AutoApprovePolicy:
+    """Opt-in, engine-level switch that lets the *engine* grant approvals itself (demos / tests only).
+
+    It is deliberately NOT a run parameter: anything a client can put in ``run.params`` must never be able to
+    bypass a human. ``kinds`` are the approval kinds that may be auto-approved ('*' = all)."""
+
+    kinds: frozenset[str]
+    actor: str = "auto-approver"
+
+    def allows(self, kind: str) -> bool:
+        return "*" in self.kinds or kind in self.kinds
+
+
 class StageSpec(BaseModel):
     """Static, declarative description of one node of the workflow graph."""
 
@@ -96,6 +111,15 @@ class StageSpec(BaseModel):
     autonomy: Autonomy = Autonomy.SUPERVISED
     parallel_group: Optional[str] = None        # informational label
     consumes: list[str] = Field(default_factory=list)  # artifact names read (drives re-plan)
+    # Per-attempt wall-clock limit. A Python thread cannot be force-killed, so on timeout the attempt is
+    # abandoned (counts as failed) but the worker thread may linger until the agent returns.
+    timeout_ms: Optional[int] = Field(default=None, gt=0)
+
+    @field_validator("approval_kind")
+    @classmethod
+    def _normalise_kind(cls, value: Optional[str]) -> Optional[str]:
+        """'Schema_Change ' and 'schema_change' are the same kind (policy compares lower-case)."""
+        return (value.strip().lower() or None) if value is not None else None
 
 
 class StageRuntime(BaseModel):
@@ -161,6 +185,8 @@ class RunMetrics(BaseModel):
     rollbacks: int = 0
     approvals_requested: int = 0
     replans: int = 0
+    approval_wait_ms: float = 0.0               # wall time with at least one approval pending (humans, not agents)
+    active_ms: Optional[float] = None           # e2e_latency_ms minus approval_wait_ms
 
 
 class Run(BaseModel):

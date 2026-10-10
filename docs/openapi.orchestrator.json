@@ -1218,6 +1218,22 @@
             "type": "integer",
             "title": "Replans",
             "default": 0
+          },
+          "approval_wait_ms": {
+            "type": "number",
+            "title": "Approval Wait Ms",
+            "default": 0.0
+          },
+          "active_ms": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Active Ms"
           }
         },
         "type": "object",
@@ -1509,6 +1525,18 @@
             },
             "type": "array",
             "title": "Consumes"
+          },
+          "timeout_ms": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "exclusiveMinimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Timeout Ms"
           }
         },
         "type": "object",

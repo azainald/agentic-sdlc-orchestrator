@@ -28,7 +28,7 @@ def test_greenfield_auto_approve_succeeds_and_prints_the_stage_table(cli):
     code, cap = cli("greenfield", "--auto-approve", "--skip-pytest")
     assert code == 0
     for phrase in ("SUCCEEDED", "STAGE", "ATTEMPTS", "GATES", "APPROVAL", "impl_analytics", "production_release",
-                   "approved by auto-approver", "SHA256", "Metrics:", "e2e=", "retries=0"):
+                   "approved by demo-auto-approver", "DEMO MODE: all approvals auto-granted", "SHA256", "Metrics:", "e2e=", "retries=0"):
         assert phrase in cap.out, phrase
 
 
@@ -120,3 +120,30 @@ def test_unknown_scenario_is_rejected_by_the_parser():
     with pytest.raises(SystemExit) as exc:
         main(["nonsense"])
     assert exc.value.code == 2
+
+
+def test_auto_approve_is_a_loud_demo_mode_with_a_machine_actor(cli):
+    code, cap = cli("greenfield", "--auto-approve", "--skip-pytest")
+    assert code == 0 and "DEMO MODE: all approvals auto-granted" in cap.out
+    rid = run_id(cap.out)
+    trace = cli("trace", rid, "--json")[1].out
+    approved = [d for d in json.loads(trace) if d["kind"] == "approval" and d["outcome"] == "approved"]
+    assert approved and {d["inputs"]["actor"] for d in approved} == {"demo-auto-approver"}
+    assert any(d["inputs"]["high_impact"] for d in approved)  # production_release is flagged high impact
+
+
+def test_banner_goes_to_stderr_with_json_so_stdout_stays_parseable(cli):
+    code, cap = cli("greenfield", "--auto-approve", "--skip-pytest", "--json")
+    assert "DEMO MODE" in cap.err and "DEMO MODE" not in cap.out
+    assert json.loads(cap.out)["state"] == "succeeded"
+
+
+def test_without_the_flag_there_is_no_banner_and_no_machine_approval(cli):
+    code, cap = cli("brownfield", "--skip-pytest")
+    assert "DEMO MODE" not in cap.out and "demo-auto-approver" not in cap.out and "WAITING_APPROVAL" in cap.out
+
+
+def test_resume_refuses_reserved_actor_names(cli):
+    rid = run_id(cli("brownfield", "--skip-pytest")[1].out)
+    code, cap = cli("resume", rid, "--approve", "api_change_review-1", "--actor", "demo-auto-approver")
+    assert code == 2 and "reserved" in cap.err

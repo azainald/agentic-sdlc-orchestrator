@@ -79,7 +79,7 @@ def test_approval_gates_of_the_brownfield_and_ambiguous_graphs():
 # -------------------------------------------------------------------- happy paths
 @pytest.mark.parametrize("name", list(SCENARIOS))
 async def test_every_scenario_succeeds_with_auto_approve(name):
-    run = await start(make_engine(), name, auto_approve=True)
+    run = await start(make_engine(auto_approve=True), name)
     assert run.state is R.SUCCEEDED, {i: (s.state.value, s.error) for i, s in run.stages.items()}
     assert set(states(run).values()) == {S.SUCCEEDED}
     assert {"requirements", "architecture", "implementation", "test_report", "documentation",
@@ -89,7 +89,7 @@ async def test_every_scenario_succeeds_with_auto_approve(name):
 
 
 async def test_greenfield_artifacts_are_grounded():
-    run = await start(make_engine(), "greenfield", auto_approve=True)
+    run = await start(make_engine(auto_approve=True), "greenfield")
     impl = run.artifacts["implementation"].content
     assert impl["status"] == "ok" and impl["verified_parts"] == ["analytics", "api", "store"]
     assert run.artifacts["release_checklist"].content["decision"] == "go"
@@ -97,7 +97,7 @@ async def test_greenfield_artifacts_are_grounded():
 
 
 async def test_ambiguous_artifacts_say_what_is_design_only():
-    run = await start(make_engine(), "ambiguous", auto_approve=True)
+    run = await start(make_engine(auto_approve=True), "ambiguous")
     impl = run.artifacts["implementation"].content
     assert impl["verified_parts"] == ["ssrf"] and impl["design_only_parts"] == ["audit", "retention"]
     risks = run.artifacts["release_checklist"].content["open_risks"]
@@ -159,8 +159,8 @@ async def test_the_ambiguity_gate_cannot_be_skipped():
     graph = [s.model_copy(deep=True) for s in get_scenario("ambiguous").graph
              if s.id not in ("normalize", "apply_interpretation")]
     next(s for s in graph if s.id == "architecture").depends_on = ["requirements"]
-    engine = make_engine()
-    run = await engine.run(create(engine, "ambiguous", graph=graph, auto_approve=True).id)
+    engine = make_engine(auto_approve=True)
+    run = await engine.run(create(engine, "ambiguous", graph=graph).id)
     assert run.state is R.FAILED
     assert states(run)["architecture"] is S.BLOCKED
     assert "ambiguity_resolved" in run.stages["architecture"].error
@@ -194,7 +194,7 @@ async def test_stop_before_start_skips_everything():
 # ------------------------------------------------------------ failure handling
 async def test_transient_failure_is_retried_with_backoff_and_succeeds():
     sleeper = Sleeper()
-    run = await start(make_engine(sleeper=sleeper), "greenfield", auto_approve=True, inject_failure="testing")
+    run = await start(make_engine(sleeper=sleeper, auto_approve=True), "greenfield", inject_failure="testing")
     assert run.state is R.SUCCEEDED
     testing = run.stages["testing"]
     assert testing.attempts == 2 and not testing.used_fallback
@@ -204,7 +204,7 @@ async def test_transient_failure_is_retried_with_backoff_and_succeeds():
 
 
 async def test_persistent_failure_uses_the_fallback_agent():
-    run = await start(make_engine(), "brownfield", auto_approve=True, inject_failure="testing_hard")
+    run = await start(make_engine(auto_approve=True), "brownfield", inject_failure="testing_hard")
     assert run.state is R.SUCCEEDED
     testing = run.stages["testing"]
     assert testing.used_fallback and testing.attempts == 4  # 3 primary attempts + 1 fallback
@@ -214,7 +214,7 @@ async def test_persistent_failure_uses_the_fallback_agent():
 
 
 async def test_total_failure_rolls_back_and_the_release_never_runs():
-    run = await start(make_engine(), "greenfield", auto_approve=True, inject_failure="testing_all")
+    run = await start(make_engine(auto_approve=True), "greenfield", inject_failure="testing_all")
     assert run.state is R.ROLLED_BACK
     assert states(run)["testing"] is S.ROLLED_BACK
     assert states(run)["release"] is S.SKIPPED and states(run)["documentation"] is S.SUCCEEDED
@@ -226,7 +226,7 @@ async def test_total_failure_rolls_back_and_the_release_never_runs():
 async def test_failed_implementation_part_fails_sync_and_skips_the_rest(monkeypatch):
     from shortener import validation
     monkeypatch.setattr(validation, "validate_ttl", lambda ttl: ttl)  # a regression in the real code
-    run = await start(make_engine(), "brownfield", auto_approve=True)
+    run = await start(make_engine(auto_approve=True), "brownfield")
     assert run.state is R.FAILED
     assert states(run)["sync"] is S.FAILED and "ttl" in run.stages["sync"].error
     assert states(run)["testing"] is S.SKIPPED and states(run)["release"] is S.SKIPPED
@@ -235,7 +235,7 @@ async def test_failed_implementation_part_fails_sync_and_skips_the_rest(monkeypa
 # ------------------------------------------------------- observability / audit
 async def test_metrics_and_telemetry_are_consistent():
     telemetry = Telemetry()
-    run = await start(make_engine(telemetry=telemetry), "greenfield", auto_approve=True, inject_failure="testing")
+    run = await start(make_engine(telemetry=telemetry, auto_approve=True), "greenfield", inject_failure="testing")
     m = run.metrics
     assert m.e2e_latency_ms > 0 and m.stages_succeeded == 9 and m.stages_failed == 0
     assert m.approvals_requested == 1 and m.retries == 1
@@ -246,11 +246,11 @@ async def test_metrics_and_telemetry_are_consistent():
     assert {"start", "stage", "gate", "artifact", "approval", "retry", "finish"} <= kinds
 
 
-@pytest.mark.parametrize("name, params", [("greenfield", {"auto_approve": True}),
-                                          ("brownfield", {"auto_approve": True, "inject_failure": "testing_all"}),
+@pytest.mark.parametrize("name, params", [("greenfield", {}),
+                                          ("brownfield", {"inject_failure": "testing_all"}),
                                           ("ambiguous", {})])
 async def test_every_decision_has_a_rationale(name, params):
-    run = await start(make_engine(), name, **params)
+    run = await start(make_engine(auto_approve=True), name, **params)
     assert len(run.decisions) > 8
     for d in run.decisions:
         assert d.rationale.strip() and d.outcome and d.kind and d.run_id == run.id, d
@@ -259,7 +259,7 @@ async def test_every_decision_has_a_rationale(name, params):
 
 
 async def test_every_published_artifact_passes_policy():
-    run = await start(make_engine(), "ambiguous", auto_approve=True)
+    run = await start(make_engine(auto_approve=True), "ambiguous")
     policy = PolicyEngine()
     for name, artifact in run.artifacts.items():
         policy.check_artifact(name, artifact.content)
@@ -279,7 +279,7 @@ def overlap(run, ids):
 
 @pytest.mark.parametrize("name", list(SCENARIOS))
 async def test_parallel_stages_overlap_in_time(name):
-    run = await start(make_engine(), name, auto_approve=True)
+    run = await start(make_engine(auto_approve=True), name)
     assert overlap(run, IMPLS[name]), "impl stages should run concurrently"
     assert overlap(run, ["testing", "documentation"]), "testing and documentation should run concurrently"
     sync = run.stages["sync"]
@@ -289,7 +289,7 @@ async def test_parallel_stages_overlap_in_time(name):
 # ------------------------------------------------------------------ slow path
 @pytest.mark.slow
 async def test_real_pytest_subprocess_path_once():
-    run = await start(make_engine(), "greenfield", auto_approve=True, skip_pytest=False)
+    run = await start(make_engine(auto_approve=True), "greenfield", skip_pytest=False)
     assert run.state is R.SUCCEEDED
     report = run.artifacts["test_report"].content
     suite = next(s for s in report["suites"] if s["kind"] == "pytest")

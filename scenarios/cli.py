@@ -19,7 +19,7 @@ from typing import Iterator, Optional
 
 from orchestrator.agents import build_agent_registry
 from orchestrator.engine import Engine
-from orchestrator.models import TERMINAL_RUN_STATES, Run, RunState
+from orchestrator.models import TERMINAL_RUN_STATES, AutoApprovePolicy, Run, RunState
 from orchestrator.store import SqliteRunStore
 from orchestrator.telemetry import Telemetry
 
@@ -44,7 +44,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     for name in SCENARIOS:
         p = sub.add_parser(name, parents=[common], help=f"run the {name} scenario")
-        p.add_argument("--auto-approve", action="store_true", help="approve every approval automatically")
+        p.add_argument("--auto-approve", action="store_true", help="DEMO ONLY: the engine grants every approval itself, actor 'demo-auto-approver'")
         p.add_argument("--inject-failure", choices=FAILURES, help="make the testing stage fail (see docs)")
         p.add_argument("--skip-pytest", action="store_true", help="do not launch the pytest subprocess")
         p.add_argument("--requirement", help="override the scenario's requirement text")
@@ -65,11 +65,13 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 @contextmanager
-def session(db: str, audit: str) -> Iterator[tuple[Engine, SqliteRunStore, Telemetry]]:
+def session(db: str, audit: str, auto_approve: bool = False) -> Iterator[tuple[Engine, SqliteRunStore, Telemetry]]:
     for path in (db, audit):
         Path(path).parent.mkdir(parents=True, exist_ok=True)
     store, telemetry = SqliteRunStore(db), Telemetry(audit_path=audit)
-    engine = Engine(build_agent_registry(), store=store, telemetry=telemetry)
+    # Demo only: the engine (not the run params) is what grants approvals without a human.
+    demo = AutoApprovePolicy(kinds=frozenset({"*"}), actor="demo-auto-approver") if auto_approve else None
+    engine = Engine(build_agent_registry(), store=store, telemetry=telemetry, auto_approve=demo)
     try:
         yield engine, store, telemetry
     finally:
@@ -95,10 +97,12 @@ def show_run(run: Run, args: argparse.Namespace) -> int:
 def cmd_scenario(args: argparse.Namespace) -> int:
     scenario = get_scenario(args.command)
     params = dict(scenario.params)
-    params.update({k: v for k, v in {"auto_approve": args.auto_approve or None,
-                                     "inject_failure": args.inject_failure,
+    params.update({k: v for k, v in {"inject_failure": args.inject_failure,
                                      "skip_pytest": args.skip_pytest or None}.items() if v})
-    with session(args.db, args.audit) as (engine, _, _):
+    if args.auto_approve:  # stderr with --json so the JSON on stdout stays parseable
+        print("*** DEMO MODE: all approvals auto-granted (no human review) ***",
+              file=sys.stderr if args.json else sys.stdout)
+    with session(args.db, args.audit, auto_approve=args.auto_approve) as (engine, _, _):
         run = engine.create_run(scenario.name, args.requirement or scenario.requirement, scenario.graph, params)
         return show_run(asyncio.run(engine.run(run.id)), args)
 

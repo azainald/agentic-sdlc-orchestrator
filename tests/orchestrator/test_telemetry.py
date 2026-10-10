@@ -182,3 +182,14 @@ def test_null_telemetry_satisfies_protocol():
     assert sink.snapshot() == {}
     for name in ("emit", "run_started", "run_finished", "events_for", "snapshot"):
         assert callable(getattr(Telemetry(), name)) and callable(getattr(NullTelemetry(), name))
+
+
+def test_snapshot_reports_active_time_without_human_waiting():
+    t = Telemetry()
+    assert t.snapshot()["avg_active_ms"] is None
+    t.run_finished(finished("a", RunState.SUCCEEDED, latency_ms=10_000, approval_wait_ms=8_000, active_ms=2_000))
+    t.run_finished(finished("b", RunState.SUCCEEDED, latency_ms=5_000, approval_wait_ms=1_000, active_ms=4_000))
+    t.run_finished(finished("c", RunState.FAILED, latency_ms=100))  # no active_ms recorded: no sample
+    snap = t.snapshot()
+    assert snap["avg_active_ms"] == pytest.approx(3_000)
+    assert snap["avg_e2e_latency_ms"] == pytest.approx((10_000 + 5_000 + 100) / 3)  # wall clock stays as it was

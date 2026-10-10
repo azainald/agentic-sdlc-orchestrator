@@ -1,6 +1,7 @@
 """Test helpers: an engine over an in-memory store with a no-op backoff, and a scenario starter."""
 from orchestrator.agents import build_agent_registry
 from orchestrator.engine import Engine
+from orchestrator.models import AutoApprovePolicy
 from orchestrator.store import InMemoryRunStore
 from scenarios.registry import get_scenario
 
@@ -15,9 +16,11 @@ class Sleeper:
         self.delays.append(seconds)
 
 
-def make_engine(store=None, telemetry=None, sleeper=None) -> Engine:
+def make_engine(store=None, telemetry=None, sleeper=None, auto_approve=False) -> Engine:
+    """``auto_approve=True`` is the demo switch: the ENGINE grants every approval (it is not a run param)."""
+    policy = AutoApprovePolicy(kinds=frozenset({"*"})) if auto_approve else None
     return Engine(build_agent_registry(), store=store if store is not None else InMemoryRunStore(),
-                  telemetry=telemetry, sleep=sleeper or Sleeper())
+                  telemetry=telemetry, sleep=sleeper or Sleeper(), auto_approve=policy)
 
 
 def create(engine: Engine, name: str, graph=None, **params):

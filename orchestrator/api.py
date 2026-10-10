@@ -45,7 +45,7 @@ from .models import (
     StageState,
     now,
 )
-from .policy import PolicyViolation
+from .policy import PolicyViolation, validate_human_actor
 from .telemetry import to_prometheus_text
 
 log = logging.getLogger("orchestrator.api")
@@ -391,6 +391,8 @@ async def create_run(body: CreateRunRequest, wait: bool = WaitParam, timeout: fl
     scenario = scenarios.get(body.scenario)
     if scenario is None:
         raise ApiError(422, "unknown_scenario", f"unknown scenario '{body.scenario}'; known: {sorted(scenarios)}")
+    if "auto_approve" in body.params:  # approvals are human decisions; no client may switch them off
+        raise ApiError(422, "auto_approve_not_allowed", "params.auto_approve is not allowed over the API")
     try:
         run = ctx.engine.create_run(scenario.name, body.requirement or scenario.requirement, scenario.graph,
                                     {**scenario.params, **body.params})
@@ -426,17 +428,21 @@ async def decide(ctx: Ctx, run_id: str, approval_id: str, body: ApprovalDecision
     approval = run.approvals.get(approval_id)
     if approval is None:
         raise ApiError(404, "approval_not_found", f"unknown approval '{approval_id}' for run '{run_id}'")
+    try:
+        actor = validate_human_actor(body.actor)  # rejects the engine's own machine actors
+    except ValueError as exc:
+        raise ApiError(422, "invalid_actor", str(exc))
     key = (run_id, approval_id)
     if approval.status != ApprovalStatus.PENDING or key in ctx.supervisor.resolving:
         raise ApiError(409, "approval_not_pending", f"approval '{approval_id}' is not pending")
     action = ctx.engine.approve if status == ApprovalStatus.APPROVED else ctx.engine.reject
     # engine.approve() resumes a paused run, i.e. it can take as long as the rest of the run,
     # so it runs as a background task exactly like POST /runs.
-    ctx.supervisor.launch(run_id, action(run_id, approval_id, body.actor, body.comment), resolving=key)
+    ctx.supervisor.launch(run_id, action(run_id, approval_id, actor, body.comment), resolving=key)
     if wait:
         await ctx.supervisor.wait(run_id, timeout)
         return reply(run_view(find_run(ctx, run_id)), 200)
-    return reply(ApprovalAccepted(run_id=run_id, approval_id=approval_id, decision=status, actor=body.actor,
+    return reply(ApprovalAccepted(run_id=run_id, approval_id=approval_id, decision=status, actor=actor,
                                   links=links_for(run_id)), 202)
 
 

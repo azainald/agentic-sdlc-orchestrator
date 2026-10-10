@@ -471,3 +471,33 @@ async def test_openapi_documents_every_endpoint(env):
             "/runs/{run_id}/dag", "/metrics", "/runs/{run_id}/approvals/{approval_id}/approve",
             "/runs/{run_id}/approvals/{approval_id}/reject"} <= set(paths)
     json.dumps(paths)
+
+
+# ------------------------------------------------------- hardening regressions
+@pytest.mark.parametrize("value", [True, False, 1, "yes"])
+async def test_client_cannot_enable_auto_approve_through_run_params(env, value):
+    """Regression: params.auto_approve used to make the engine skip every human approval."""
+    r = await start(env, "gated", params={"auto_approve": value})
+    assert_error(r, 422, "auto_approve_not_allowed")
+    assert (await env.client.get("/runs")).json() == []  # nothing was created
+
+
+async def test_gated_run_still_waits_for_a_human_and_params_do_not_leak_auto_approval(env):
+    run_id, approval_id = await gated_run(env)
+    view = (await env.client.get(f"/runs/{run_id}")).json()
+    assert view["state"] == "waiting_approval" and "auto_approve" not in view["params"]
+
+
+@pytest.mark.parametrize("actor", ["auto-approver", "Demo-Auto-Approver", "engine", " SYSTEM "])
+async def test_reserved_actor_names_cannot_approve_or_reject_over_http(env, actor):
+    run_id, approval_id = await gated_run(env)
+    for verb in ("approve", "reject"):
+        r = await env.client.post(approve_url(run_id, approval_id, verb), json={"actor": actor})
+        assert_error(r, 422, "invalid_actor")
+    assert (await env.client.get(f"/runs/{run_id}")).json()["pending_approvals"][0]["id"] == approval_id
+
+
+async def test_actor_whitespace_is_stripped(env):
+    run_id, approval_id = await gated_run(env)
+    r = await env.client.post(approve_url(run_id, approval_id), params={"wait": "true"}, json={"actor": "  alice "})
+    assert r.status_code == 200 and r.json()["approvals"][0]["actor"] == "alice"

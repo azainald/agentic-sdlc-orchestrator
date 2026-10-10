@@ -10,6 +10,13 @@ mutation of the ``Run`` happens on the event-loop thread, so no locks are
 needed. When nothing is in flight and a stage is waiting for a human, ``run()``
 saves the run and returns; ``approve()``/``reject()`` later resume it, even from
 a brand-new ``Engine`` sharing the same store.
+
+Known limitations (documented, not fixed):
+* Resuming the same run from two processes at once is unsafe: the store has no compare-and-swap, so the
+  last writer wins. Run one resumer per run (the HTTP API guards this inside a single process only).
+* After a restart, a stage that was RUNNING is re-queued, and if it needs approval it asks for a NEW
+  approval even though the earlier one was granted (see ``_recover_interrupted``).
+* A Python thread cannot be killed, so a timed-out agent keeps running in its worker thread until it returns.
 """
 from __future__ import annotations
 
@@ -31,6 +38,7 @@ from .models import (
     Approval,
     ApprovalStatus,
     Artifact,
+    AutoApprovePolicy,
     DecisionRecord,
     GateContext,
     GateFn,
@@ -43,10 +51,13 @@ from .models import (
     fingerprint,
     now,
 )
-from .policy import HIGH_IMPACT, PolicyEngine, PolicyViolation
+from .policy import HIGH_IMPACT, PolicyEngine, PolicyViolation, approval_kind_of, validate_human_actor
 
-AUTO_APPROVER = "auto-approver"
-MAX_REPLANS = 3  # circuit breaker so a re-plan loop can never spin forever
+MAX_REPLANS = 3  # per source stage: a re-plan loop can never spin forever; hitting it FAILS the run
+
+
+class _StopRequested(Exception):
+    """Raised inside a stage when stop() arrives between attempts: the remaining attempts are skipped."""
 
 
 class _MemoryStore:
@@ -96,13 +107,17 @@ class Engine:
         telemetry: Optional[TelemetrySink] = None,
         max_workers: int = 6,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        auto_approve: Optional[AutoApprovePolicy] = None,
     ):
+        """``auto_approve`` is the ONLY way approvals get granted without a human. It is a constructor
+        argument, never a run parameter, so a client of the API cannot switch it on."""
         self.agents = agents
         self.gates = GATES if gates is None else gates  # a custom registry replaces, not extends
         self.policy = policy or PolicyEngine()
         self.store: RunStore = store if store is not None else _MemoryStore()
         self.telemetry: TelemetrySink = telemetry if telemetry is not None else _NullTelemetry()
         self._sleep = sleep
+        self.auto_approve = auto_approve
         self._pool = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="agent")
         self._live: dict[str, Run] = {}            # runs whose run() loop is active in this engine
         self._wake: dict[str, asyncio.Event] = {}  # lets approve()/stop() interrupt the loop's wait
@@ -151,10 +166,14 @@ class Engine:
         return run
 
     async def approve(self, run_id: str, approval_id: str, actor: str, comment: str = "") -> Run:
-        return await self._resolve(run_id, approval_id, actor, comment, ApprovalStatus.APPROVED)
+        return await self._resolve(run_id, approval_id, self._human(actor), comment, ApprovalStatus.APPROVED)
 
     async def reject(self, run_id: str, approval_id: str, actor: str, comment: str = "") -> Run:
-        return await self._resolve(run_id, approval_id, actor, comment, ApprovalStatus.REJECTED)
+        return await self._resolve(run_id, approval_id, self._human(actor), comment, ApprovalStatus.REJECTED)
+
+    def _human(self, actor: str) -> str:
+        """Human decisions need a real name; the engine's machine actors are reserved."""
+        return validate_human_actor(actor, [self.auto_approve.actor] if self.auto_approve else [])
 
     def stop(self, run_id: str) -> Run:
         """Safe-stop: in-flight stages finish, everything not started is skipped."""
@@ -226,30 +245,36 @@ class Engine:
         launches: list[str] = []
         for stage_id in order:  # topological, so a skip cascades down in one pass
             st = run.stages[stage_id]
-            if st.state == StageState.READY:  # approved by a human, gates already passed
-                self._begin(run, st)
-                launches.append(stage_id)
-            elif st.state == StageState.PENDING:
+            if st.state in (StageState.PENDING, StageState.READY):  # READY = a human approved it meanwhile
+                approved = st.state == StageState.READY
                 status = dependency_status(st.spec, {i: s.state for i, s in run.stages.items()})
                 if status == DEAD:
                     st.state = StageState.SKIPPED
                     self._record(run, "stage", "an upstream stage failed or was skipped", "skipped", stage_id,
                                  depends_on=st.spec.depends_on)
-                elif status == READY and self._admit(run, st):
+                elif status == READY and self._admit(run, st, approved):
                     self._begin(run, st)
                     launches.append(stage_id)
+                elif status != READY and approved:  # the world changed while it waited: start over, ask again
+                    st.state = StageState.PENDING
+                    self._record(run, "stage", "dependencies changed after approval; waiting again", "requeued",
+                                 stage_id)
         return launches
 
-    def _admit(self, run: Run, st: StageRuntime) -> bool:
-        """Entry gates, then approval. True means: launch now."""
+    def _admit(self, run: Run, st: StageRuntime, approved: bool = False) -> bool:
+        """Entry gates, then approval. True means: launch now. ``approved``: a human already said yes, but
+        evidence may have changed during the wait, so the entry gates are checked again."""
         results = self._evaluate_gates(run, st, st.spec.entry_gates, "entry")
         failed = [r for r in results if not r.passed]
         if failed:
             st.state = StageState.BLOCKED
             st.error = "; ".join(f"{r.gate}: {r.message}" for r in failed)
             st.ended_at = now()
-            self._record(run, "stage", "entry gate failed, stage blocked", "blocked", st.spec.id, error=st.error)
+            self._record(run, "stage", "entry gate failed" + (" after approval" if approved else "") + ", stage blocked",
+                         "blocked", st.spec.id, error=st.error, after_approval=approved)
             return False
+        if approved:
+            return True
         if self.policy.requires_human(st.spec):
             return self._request_approval(run, st)
         return True
@@ -262,8 +287,11 @@ class Engine:
             st.state, st.error, st.ended_at = StageState.FAILED, f"internal engine error: {exc!r}", now()
             self._record(run, "stage", st.error, "failed", stage_id)
             return
-        if st.state == StageState.SUCCEEDED and changed:
-            self._maybe_replan(run, stage_id, changed)
+        if st.state == StageState.SUCCEEDED:
+            if self._replan_if_self_stale(run, st):
+                return  # it will run again on fresh input; its outputs are republished then
+            if changed:
+                self._maybe_replan(run, stage_id, changed)
 
     # ============================================================ stage execution
     def _begin(self, run: Run, st: StageRuntime) -> None:
@@ -284,6 +312,7 @@ class Engine:
         try:
             changed = await self._attempts(run, st, spec.agent, spec.max_attempts, fallback=False)
             if changed is None and spec.fallback_agent:
+                self._check_not_stopped(run)
                 run.metrics.fallbacks += 1
                 st.used_fallback = True
                 self._record(run, "fallback", f"retries exhausted; trying fallback agent '{spec.fallback_agent}'",
@@ -295,6 +324,11 @@ class Engine:
                              used_fallback=st.used_fallback)
                 return changed
             await self._fail(run, st)
+        except _StopRequested:
+            # stop() arrived between attempts: not a failure of the stage, just work we chose not to start.
+            st.state = StageState.SKIPPED
+            self._record(run, "stop", f"stop requested; remaining attempts skipped (last error: {st.error})",
+                         "skipped", spec.id)
         except PolicyViolation as violation:
             # Hard stop: no retry, no fallback, no rollback agent. Safe-stop the rest.
             st.state, st.error = StageState.FAILED, str(violation)
@@ -313,6 +347,8 @@ class Engine:
         backoff. Returns changed artifact names on success, None if all failed."""
         spec = st.spec
         for attempt in range(1, max_attempts + 1):
+            if attempt > 1:
+                self._check_not_stopped(run)  # the in-flight attempt was allowed to end; no new ones
             st.attempts += 1
             error, changed = await self._attempt(run, st, agent_name, fallback)
             if error is None:
@@ -327,13 +363,24 @@ class Engine:
                 await self._sleep(delay_ms / 1000)
         return None
 
+    @staticmethod
+    def _check_not_stopped(run: Run) -> None:
+        if run.stop_requested:
+            raise _StopRequested()
+
     async def _attempt(self, run: Run, st: StageRuntime, agent_name: str,
                        fallback: bool) -> tuple[Optional[str], set[str]]:
         """One agent call + policy + exit gates. Returns (error, changed).
         Artifacts are only published if the whole attempt succeeds."""
         ctx = self._context(run, st, fallback)
+        timeout_ms = st.spec.timeout_ms
         try:
-            result = await asyncio.get_running_loop().run_in_executor(self._pool, self.agents[agent_name], ctx)
+            call = asyncio.get_running_loop().run_in_executor(self._pool, self.agents[agent_name], ctx)
+            # Known limitation: on timeout we stop WAITING, but a Python thread cannot be force-killed, so the
+            # agent keeps running in its worker thread until it returns (its late result is discarded).
+            result = await (asyncio.wait_for(call, timeout_ms / 1000) if timeout_ms else call)
+        except asyncio.TimeoutError:
+            return f"timeout after {timeout_ms} ms", set()
         except Exception as exc:  # agent crashed: that is a failed attempt, not an engine crash
             return str(exc) or type(exc).__name__, set()
         if not isinstance(result, AgentResult):
@@ -371,6 +418,11 @@ class Engine:
             st.state = StageState.FAILED
             self._record(run, "stage", f"stage failed: {failure}", "failed", spec.id)
             return
+        if run.stop_requested:  # no new agent launches once stop is requested, rollback included
+            st.state = StageState.FAILED
+            st.error = f"{failure}; rollback agent not launched: stop requested"
+            self._record(run, "rollback", "stop requested; rollback agent not launched", "skipped", spec.id)
+            return
         run.metrics.rollbacks += 1
         ctx = self._context(run, st, False, rollback=True, failure=failure)
         try:
@@ -390,19 +442,19 @@ class Engine:
         False if the stage must wait for a human."""
         spec = st.spec
         n = sum(1 for a in run.approvals.values() if a.stage_id == spec.id) + 1
-        approval = Approval(id=f"{spec.id}-{n}", run_id=run.id, stage_id=spec.id,
-                            kind=spec.approval_kind or "generic")
+        kind = approval_kind_of(spec) or "generic"
+        approval = Approval(id=f"{spec.id}-{n}", run_id=run.id, stage_id=spec.id, kind=kind)
         run.approvals[approval.id] = approval
         run.metrics.approvals_requested += 1
         self._record(run, "approval", f"approval '{approval.kind}' requested for stage '{spec.id}'", "requested",
                      spec.id, approval_id=approval.id, approval_kind=approval.kind)
-        if run.params.get("auto_approve"):
+        if self.auto_approve is not None and self.auto_approve.allows(kind):
             # Still a full audit trail: a real Approval + decision, just with a machine actor.
-            approval.status, approval.actor = ApprovalStatus.APPROVED, AUTO_APPROVER
-            approval.resolved_at, approval.comment = now(), "params.auto_approve is set"
-            self._record(run, "approval", "auto-approved because params.auto_approve is set", "approved",
-                         spec.id, approval_id=approval.id, actor=AUTO_APPROVER,
-                         high_impact=spec.approval_kind in HIGH_IMPACT)
+            actor = self.auto_approve.actor
+            approval.status, approval.actor = ApprovalStatus.APPROVED, actor
+            approval.resolved_at, approval.comment = now(), "granted by the engine's AutoApprovePolicy"
+            self._record(run, "approval", f"auto-approved by the engine's AutoApprovePolicy ({actor})", "approved",
+                         spec.id, approval_id=approval.id, actor=actor, high_impact=kind in HIGH_IMPACT)
             return True
         st.state = StageState.WAITING_APPROVAL
         return False
@@ -453,43 +505,70 @@ class Engine:
         artifact existed) worked from stale input: reset it, and everything
         downstream of it, to PENDING so the main loop runs it again.
 
-        Limitation: stages that are RUNNING right now are left alone."""
+        Stages that are RUNNING right now are left alone here; ``_replan_if_self_stale`` catches them
+        when they finish."""
         if run.stop_requested:
             return
         stale: dict[str, dict[str, dict[str, str]]] = {}
         for stage_id, st in run.stages.items():
-            if stage_id == source_id or st.state != StageState.SUCCEEDED:
-                continue
-            diff = {
-                name: {"consumed": st.input_hashes.get(name) or "(absent)", "current": run.artifacts[name].sha256}
-                for name in sorted(changed)
-                if name in st.spec.consumes and st.input_hashes.get(name) != run.artifacts[name].sha256
-            }
-            if diff:
-                stale[stage_id] = diff
-        if not stale:
-            return
+            if stage_id != source_id and st.state == StageState.SUCCEEDED:
+                diff = self._stale_inputs(run, st, changed)
+                if diff:
+                    stale[stage_id] = diff
+        self._replan(run, source_id, stale, f"'{source_id}' changed {sorted(changed)}", exclude={source_id})
 
+    def _replan_if_self_stale(self, run: Run, st: StageRuntime) -> bool:
+        """A stage just succeeded. If an input it consumed changed while it was RUNNING, its result is built on
+        stale data: re-plan it (and everything downstream). Returns True if it was reset or failed."""
+        if run.stop_requested:
+            return False
+        own = {n for n in st.spec.consumes if n in run.artifacts and run.artifacts[n].produced_by != st.spec.id}
+        diff = self._stale_inputs(run, st, own)
+        return bool(diff) and self._replan(run, st.spec.id, {st.spec.id: diff},
+                                           f"'{st.spec.id}' finished on inputs that changed while it ran")
+
+    @staticmethod
+    def _stale_inputs(run: Run, st: StageRuntime, names: set[str]) -> dict[str, dict[str, str]]:
+        """artifact -> {consumed, current} for the ``names`` this stage consumed in an older version."""
+        return {
+            name: {"consumed": st.input_hashes.get(name) or "(absent)", "current": run.artifacts[name].sha256}
+            for name in sorted(names)
+            if name in st.spec.consumes and name in run.artifacts and st.input_hashes.get(name) != run.artifacts[name].sha256
+        }
+
+    def _replan(self, run: Run, source_id: str, stale: dict[str, dict[str, dict[str, str]]], reason: str,
+                exclude: frozenset[str] | set[str] = frozenset()) -> bool:
+        """Reset the stale stages and everything downstream of them. If ``source_id`` already caused
+        MAX_REPLANS re-plans, FAIL the run's stale stages instead (never silently carry on with stale work)."""
+        if not stale:
+            return False
         specs = [s.spec for s in run.stages.values()]
         to_reset = set(stale)
         for stage_id in stale:
             to_reset |= downstream(specs, stage_id)
         to_reset = {i for i in to_reset
-                    if i != source_id and run.stages[i].state not in (StageState.PENDING, StageState.RUNNING)}
+                    if i not in exclude and run.stages[i].state not in (StageState.PENDING, StageState.RUNNING)}
         if not to_reset:
-            return
+            return False
 
         reset_ids = [i for i in run.stages if i in to_reset]  # graph order, for a readable record
-        if run.metrics.replans >= MAX_REPLANS:
-            self._record(run, "replan", f"re-plan limit ({MAX_REPLANS}) reached; not resetting {reset_ids}",
-                         "suppressed", source_id, stale=stale)
-            return
+        applied = sum(1 for d in run.decisions if d.kind == "replan" and d.outcome == "applied" and d.stage_id == source_id)
+        if applied >= MAX_REPLANS:
+            failed = [i for i in reset_ids if run.stages[i].state == StageState.SUCCEEDED]
+            for stage_id in failed:
+                st = run.stages[stage_id]
+                st.state, st.error, st.ended_at = StageState.FAILED, "stale_after_replan_limit", now()
+            self._record(run, "replan", f"{reason}, but '{source_id}' already caused {MAX_REPLANS} re-plans: "
+                         f"failing stale stages {failed} instead of continuing with stale results",
+                         "limit_exceeded", source_id, stale=stale, failed=failed)
+            return True
         for stage_id in reset_ids:
             self._reset_stage(run, run.stages[stage_id])
         run.metrics.replans += 1
         why = "; ".join(f"'{s}' consumed outdated {sorted(d)}" for s, d in stale.items())
-        self._record(run, "replan", f"'{source_id}' changed {sorted(changed)}: {why}. Re-running {reset_ids}",
-                     "applied", source_id, changed=sorted(changed), stale=stale, reset=reset_ids)
+        self._record(run, "replan", f"{reason}: {why}. Re-running {reset_ids}",
+                     "applied", source_id, stale=stale, reset=reset_ids, changed=sorted({n for d in stale.values() for n in d}))
+        return True
 
     def _reset_stage(self, run: Run, st: StageRuntime) -> None:
         self._cancel_approvals(run, st.spec.id, "superseded by re-plan")
@@ -536,6 +615,8 @@ class Engine:
             return
         m.ended_at = now()
         m.e2e_latency_ms = (m.ended_at - (m.started_at or m.ended_at)) * 1000
+        m.approval_wait_ms = self._approval_wait_ms(run, m.ended_at)
+        m.active_ms = max(0.0, m.e2e_latency_ms - m.approval_wait_ms)  # what the system itself spent
         states = [s.state for s in run.stages.values()]
         m.stages_succeeded = states.count(StageState.SUCCEEDED)
         m.stages_failed = sum(s in (StageState.FAILED, StageState.ROLLED_BACK, StageState.BLOCKED) for s in states)
@@ -543,9 +624,26 @@ class Engine:
                      succeeded=m.stages_succeeded, failed=m.stages_failed)
         self.telemetry.run_finished(run)
 
+    @staticmethod
+    def _approval_wait_ms(run: Run, ended_at: float) -> float:
+        """Wall time during which at least one approval was pending (overlapping waits count once)."""
+        spans = sorted((a.requested_at, a.resolved_at if a.resolved_at is not None else ended_at)
+                       for a in run.approvals.values())
+        total, cursor = 0.0, None
+        for start, end in spans:
+            if cursor is not None and start < cursor:
+                start = cursor
+            if end > start:
+                total += end - start
+            cursor = end if cursor is None else max(cursor, end)
+        return total * 1000
+
     def _recover_interrupted(self, run: Run) -> None:
         """After a crash/restart a stage may be stuck in RUNNING with no task
-        behind it. Agents are re-runnable, so put it back to PENDING."""
+        behind it. Agents are re-runnable, so put it back to PENDING.
+
+        Known limitation: if that stage needed approval, the earlier (granted) approval is not reused, so
+        it asks for a fresh one."""
         for stage_id, st in run.stages.items():
             if st.state == StageState.RUNNING:
                 st.state = StageState.PENDING

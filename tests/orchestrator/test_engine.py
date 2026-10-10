@@ -8,7 +8,7 @@ import pytest
 
 from orchestrator.engine import Engine
 from orchestrator.models import (
-    AgentResult, ApprovalStatus, Autonomy, Run, RunState as R, StageSpec, StageState as S,
+    AgentResult, ApprovalStatus, AutoApprovePolicy, Autonomy, Run, RunState as R, StageSpec, StageState as S,
 )
 from orchestrator.policy import PolicyViolation
 
@@ -445,9 +445,12 @@ async def test_resolving_an_approval_twice_or_unknown_is_an_error(build):
         await engine.approve(run.id, "nope", "alice")
 
 
+ALL = AutoApprovePolicy(kinds=frozenset({"*"}))
+
+
 async def test_auto_approve_runs_straight_through_but_keeps_audit_trail(build):
-    engine = build({"a": make(), "ship": make(), "after": make()})
-    run = await execute(engine, approval_graph(), auto_approve=True)
+    engine = build({"a": make(), "ship": make(), "after": make()}, auto_approve=ALL)
+    run = await execute(engine, approval_graph())
 
     assert run.state == R.SUCCEEDED
     [approval] = run.approvals.values()
@@ -455,8 +458,30 @@ async def test_auto_approve_runs_straight_through_but_keeps_audit_trail(build):
     assert approval.resolved_at is not None
     outcomes = [d.outcome for d in decisions(run, "approval")]
     assert outcomes == ["requested", "approved"]
-    assert decisions(run, "approval", "approved")[0].inputs["actor"] == "auto-approver"
+    approved = decisions(run, "approval", "approved")[0]
+    assert approved.inputs["actor"] == "auto-approver" and approved.inputs["high_impact"] is True  # public_api_change
     assert run.metrics.approvals_requested == 1
+
+
+async def test_run_params_can_never_enable_auto_approve(build):
+    """Regression: params['auto_approve'] used to skip every human approval."""
+    engine = build({"a": make(), "ship": make(), "after": make()})
+    run = await execute(engine, approval_graph(), auto_approve=True)
+    assert run.state == R.WAITING_APPROVAL
+    assert next(iter(run.approvals.values())).status == ApprovalStatus.PENDING
+    assert not decisions(run, "approval", "approved")
+
+
+async def test_auto_approve_policy_is_limited_to_its_kinds_and_uses_its_actor(build):
+    policy = AutoApprovePolicy(kinds=frozenset({"requirement_interpretation"}), actor="ci-bot")
+    engine = build({"a": make(), "ship": make(), "after": make(), "x": make(), "y": make()}, auto_approve=policy)
+    graph = approval_graph() + [spec("x", requires_approval=True, approval_kind="requirement_interpretation"),
+                                spec("y", ["x"])]
+    run = await execute(engine, graph)
+    assert run.state == R.WAITING_APPROVAL  # public_api_change is not in `kinds`: a human must decide
+    assert run.approvals["ship-1"].status == ApprovalStatus.PENDING
+    assert run.approvals["x-1"].actor == "ci-bot" and run.stages["y"].state == S.SUCCEEDED
+    assert decisions(run, "approval", "approved")[0].inputs["high_impact"] is False
 
 
 async def test_independent_branches_keep_running_while_approval_pending(build):
@@ -652,7 +677,7 @@ async def test_no_replan_when_consumer_already_saw_current_artifact(build):
     assert run.metrics.replans == 0 and run.stages["b"].runs == 1
 
 
-async def test_replan_is_capped_by_circuit_breaker(build, monkeypatch):
+async def test_replan_limit_fails_the_run_loudly_instead_of_continuing_with_stale_work(build, monkeypatch):
     import orchestrator.engine as eng
     monkeypatch.setattr(eng, "MAX_REPLANS", 0)
     done = threading.Event()
@@ -665,11 +690,76 @@ async def test_replan_is_capped_by_circuit_breaker(build, monkeypatch):
         done.set()
         return AgentResult()
 
-    engine = build({"producer": producer, "consumer": consumer})
-    run = await execute(engine, [spec("producer"), spec("consumer", consumes=["spec"])])
-    assert run.state == R.SUCCEEDED and run.metrics.replans == 0
-    assert decisions(run, "replan", "suppressed")
+    engine = build({"producer": producer, "consumer": consumer, "after": make()})
+    run = await execute(engine, [spec("producer"), spec("consumer", consumes=["spec"]),
+                                 spec("after", ["consumer"])])
+    assert run.state == R.FAILED and run.metrics.replans == 0
+    assert run.stages["consumer"].state == S.FAILED and run.stages["consumer"].error == "stale_after_replan_limit"
+    assert run.stages["after"].state in (S.FAILED, S.SKIPPED)  # timing decides whether it had already run
     assert run.stages["consumer"].runs == 1
+    [limit] = decisions(run, "replan", "limit_exceeded")
+    assert limit.stage_id == "producer" and limit.inputs["failed"][0] == "consumer"
+
+
+async def test_replan_cap_is_per_source_stage(build, monkeypatch):
+    """Two different sources each get their own budget: one re-plan from each is fine with MAX_REPLANS=1."""
+    import orchestrator.engine as eng
+    monkeypatch.setattr(eng, "MAX_REPLANS", 1)
+    gate_a, gate_b, done = threading.Event(), threading.Event(), threading.Event()
+
+    def prod_a(ctx):
+        assert done.wait(WAIT_S)
+        return AgentResult(artifacts={"a": {"v": 1}})
+
+    def prod_b(ctx):
+        assert gate_a.wait(WAIT_S)
+        return AgentResult(artifacts={"b": {"v": 1}})
+
+    def consumer(ctx):
+        done.set()
+        if "a" in ctx.artifacts:
+            gate_a.set()
+        return AgentResult()
+
+    engine = build({"pa": prod_a, "pb": prod_b, "c": consumer})
+    run = await execute(engine, [spec("pa"), spec("pb"), spec("c", consumes=["a", "b"])])
+    assert run.state == R.SUCCEEDED and run.metrics.replans == 2
+    assert [d.stage_id for d in decisions(run, "replan", "applied")] == ["pa", "pb"]
+
+
+async def test_running_consumer_that_finishes_on_stale_input_is_replanned(build):
+    """Regression: a stage still RUNNING when its input changed was left alone and finished 'successfully'
+    on stale data. Now it is re-run (and so is everything downstream)."""
+    started, release = threading.Event(), threading.Event()
+    seen = []
+
+    def producer(ctx):
+        assert started.wait(WAIT_S)
+        return AgentResult(artifacts={"spec": {"v": "final"}})
+
+    def consumer(ctx):
+        seen.append(ctx.artifacts.get("spec"))
+        if len(seen) == 1:  # first run: stay busy until the producer's artifact has been published
+            started.set()
+            assert release.wait(WAIT_S)
+        return AgentResult(artifacts={"out": {"saw": (ctx.artifacts.get("spec") or {}).get("v")}})
+
+    engine = build({"producer": producer, "consumer": consumer, "after": make("after_out")})
+    run = engine.create_run("t", "r", [spec("producer"), spec("consumer", consumes=["spec"]),
+                                       spec("after", ["consumer"])])
+    task = asyncio.create_task(engine.run(run.id))
+    while "spec" not in engine.get_run(run.id).artifacts:
+        await asyncio.sleep(0.01)
+    release.set()
+    final = await asyncio.wait_for(task, WAIT_S)
+
+    assert final.state == R.SUCCEEDED
+    assert seen == [None, {"v": "final"}]
+    assert final.artifacts["out"].content == {"saw": "final"}
+    assert final.stages["consumer"].runs == 2 and final.stages["after"].runs == 1  # 'after' had not started yet
+    assert final.metrics.replans == 1
+    [replan] = decisions(final, "replan", "applied")
+    assert replan.stage_id == "consumer" and "changed while it ran" in replan.rationale
 
 
 # ---------------------------------------------------- validation / telemetry
@@ -757,3 +847,192 @@ async def test_interrupted_running_stage_is_requeued_on_resume(build):
     final = await build(agents, store=store).run(run.id)
     assert final.state == R.SUCCEEDED and agents["a"].count == 1
     assert decisions(final, "stage", "recovered")
+
+
+# ============================================================ hardening regressions
+# ---------------------------------------------------------------- stop semantics
+async def _stop_during_first_attempt(build, graph, agents):
+    """Start a run, stop it while the first attempt of stage 'a' is in flight, then let that attempt fail."""
+    started, release = threading.Event(), threading.Event()
+    engine = build({name: (fn(started, release) if name == "a" else fn) for name, fn in agents.items()})
+    run = engine.create_run("t", "r", graph)
+    task = asyncio.create_task(engine.run(run.id))
+    while not started.is_set():
+        await asyncio.sleep(0.01)
+    engine.stop(run.id)
+    release.set()
+    return await asyncio.wait_for(task, WAIT_S)
+
+
+def _failing_after_release(counter):
+    def agent_factory(started, release):
+        def agent(ctx):
+            counter.append(ctx.attempt)
+            started.set()
+            assert release.wait(WAIT_S)
+            raise RuntimeError("boom")
+        return agent
+    return agent_factory
+
+
+async def test_stop_skips_remaining_retries_and_the_run_ends_stopped_not_failed(build):
+    attempts = []
+    final = await _stop_during_first_attempt(
+        build, [spec("a", max_attempts=3), spec("b", ["a"])],
+        {"a": _failing_after_release(attempts), "b": make()})
+    assert attempts == [1]  # the in-flight attempt ended, no retry was started
+    assert final.stages["a"].state == S.SKIPPED and final.stages["b"].state == S.SKIPPED
+    assert final.state == R.STOPPED
+    assert decisions(final, "stop", "skipped")
+
+
+async def test_stop_skips_the_fallback_agent(build):
+    fallback = Calls(make())
+    final = await _stop_during_first_attempt(
+        build, [spec("a", max_attempts=1, fallback_agent="fb")], {"a": _failing_after_release([]), "fb": fallback})
+    assert fallback.count == 0 and final.metrics.fallbacks == 0
+    assert final.stages["a"].state == S.SKIPPED and final.state == R.STOPPED
+
+
+async def test_stop_does_not_launch_the_rollback_agent_and_the_stage_counts_as_failed(build):
+    undo = Calls(make())
+    final = await _stop_during_first_attempt(
+        build, [spec("a", max_attempts=1, rollback_agent="undo")], {"a": _failing_after_release([]), "undo": undo})
+    assert undo.count == 0 and final.metrics.rollbacks == 0
+    assert final.stages["a"].state == S.FAILED and "rollback agent not launched" in final.stages["a"].error
+    assert final.state == R.FAILED  # the stage really failed (retries were spent) before the stop took effect
+
+
+# ----------------------------------------------------------------- timeout
+async def test_agent_timeout_fails_the_attempt_and_counts_toward_retries(build):
+    release = threading.Event()
+
+    def hangs(ctx):
+        release.wait(WAIT_S)  # the worker thread cannot be killed; it lingers until we release it
+        return AgentResult()
+
+    engine = build({"a": hangs})
+    run = await execute(engine, [spec("a", max_attempts=2, timeout_ms=50)])
+    release.set()
+    assert run.state == R.FAILED
+    assert run.stages["a"].error == "timeout after 50 ms"
+    assert run.stages["a"].attempts == 2 and run.metrics.retries == 1
+
+
+async def test_timed_out_attempt_can_succeed_on_retry(build):
+    release = threading.Event()
+
+    def sometimes_hangs(ctx):
+        if ctx.attempt == 1:
+            release.wait(WAIT_S)
+        return AgentResult(artifacts={"out": {"attempt": ctx.attempt}})
+
+    engine = build({"a": sometimes_hangs})
+    run = await execute(engine, [spec("a", max_attempts=2, timeout_ms=50)])
+    release.set()
+    assert run.state == R.SUCCEEDED and run.artifacts["out"].content == {"attempt": 2}
+
+
+def test_timeout_must_be_positive():
+    with pytest.raises(ValueError):
+        spec("a", timeout_ms=0)
+
+
+def test_scenario_testing_stages_have_a_timeout():
+    from scenarios.registry import SCENARIOS
+    for name, build_scenario in SCENARIOS.items():
+        testing = next(s for s in build_scenario().graph if s.id == "testing")
+        assert testing.timeout_ms == 120_000, name
+
+
+# ------------------------------------------------- entry gates after approval
+async def test_entry_gates_are_rechecked_after_approval(build):
+    from orchestrator.models import GateResult
+    gates = {"still_ok": lambda c: GateResult(gate="still_ok", passed=bool(c.params.get("ok")),
+                                              message="ok flag cleared")}
+    store, ship = JsonStore(), Calls(make())
+    engine = build({"a": make(), "ship": ship}, store=store, gates=gates)
+    run = await execute(engine, [spec("a"), spec("ship", ["a"], requires_approval=True, entry_gates=["still_ok"])],
+                        ok=True)
+    assert run.state == R.WAITING_APPROVAL  # the gate passed when approval was requested
+
+    stored = store.load_run(run.id)  # the evidence changes while the human thinks about it
+    stored.params["ok"] = False
+    store.save_run(stored)
+    done = await build({"a": make(), "ship": ship}, store=store, gates=gates).approve(run.id, "ship-1", "alice")
+
+    assert ship.count == 0
+    assert done.stages["ship"].state == S.BLOCKED and "ok flag cleared" in done.stages["ship"].error
+    assert done.state == R.FAILED
+    assert decisions(done, "stage", "blocked")[0].inputs["after_approval"] is True
+
+
+# ----------------------------------------------------- approval identity / case
+@pytest.mark.parametrize("actor", ["", "   ", "auto-approver", "Demo-Auto-Approver", " engine ", "SYSTEM"])
+async def test_reserved_or_blank_actors_cannot_make_human_decisions(build, actor):
+    engine = build({"a": make(), "ship": make(), "after": make()})
+    run = await execute(engine, approval_graph())
+    for decide in (engine.approve, engine.reject):
+        with pytest.raises(ValueError):
+            await decide(run.id, "ship-1", actor)
+    assert engine.get_run(run.id).approvals["ship-1"].status == ApprovalStatus.PENDING
+
+
+async def test_the_configured_auto_approver_name_is_reserved_too(build):
+    engine = build({"a": make(), "ship": make(), "after": make()},
+                   auto_approve=AutoApprovePolicy(kinds=frozenset({"nothing"}), actor="ci-bot"))
+    run = await execute(engine, approval_graph())
+    with pytest.raises(ValueError, match="reserved"):
+        await engine.approve(run.id, "ship-1", "CI-Bot")
+
+
+async def test_actor_is_stripped_before_it_is_recorded(build):
+    engine = build({"a": make(), "ship": make(), "after": make()})
+    run = await execute(engine, approval_graph())
+    done = await engine.approve(run.id, "ship-1", "  alice  ")
+    assert done.approvals["ship-1"].actor == "alice"
+
+
+async def test_approval_kind_case_cannot_dodge_high_impact_handling(build):
+    assert spec("x", approval_kind=" Public_API_Change ").approval_kind == "public_api_change"
+    engine = build({"a": make(), "ship": make()}, auto_approve=ALL)
+    # high impact, written in odd case, with requires_approval=False: must still be rejected
+    with pytest.raises(PolicyViolation):
+        engine.create_run("t", "r", [spec("ship", agent="a", approval_kind="SCHEMA_CHANGE")])
+    run = await execute(engine, [spec("ship", requires_approval=True, approval_kind="Public_Api_Change ")])
+    assert run.approvals["ship-1"].kind == "public_api_change"
+    assert decisions(run, "approval", "approved")[0].inputs["high_impact"] is True
+
+
+# ---------------------------------------------------------- fallback + approval
+def test_create_run_rejects_a_fallback_on_a_stage_that_needs_approval(build):
+    engine = build({"a": make(), "fb": make()})
+    with pytest.raises(PolicyViolation) as exc:
+        engine.create_run("t", "r", [spec("a", requires_approval=True, fallback_agent="fb")])
+    assert exc.value.rule == "fallback_requires_own_approval"
+    engine.create_run("t", "r", [spec("a", requires_approval=True, rollback_agent="fb")])  # undo is fine
+
+
+# ------------------------------------------------------------------- latency
+def test_approval_wait_counts_overlapping_waits_once():
+    from orchestrator.models import Approval
+    run = Run(id="r", scenario="s", requirement="q")
+    for i, (start, end) in enumerate([(0, 10), (5, 12), (20, 25)]):
+        run.approvals[str(i)] = Approval(id=str(i), run_id="r", stage_id="s", kind="k", requested_at=start,
+                                         resolved_at=end, status=ApprovalStatus.APPROVED)
+    assert Engine._approval_wait_ms(run, ended_at=100) == pytest.approx((12 + 5) * 1000)
+
+
+async def test_metrics_split_human_waiting_from_active_time(build):
+    store = JsonStore()
+    engine = build({"a": make(), "ship": make(), "after": make()}, store=store)
+    run = await execute(engine, approval_graph())
+    stored = store.load_run(run.id)  # pretend the human took 10 s, inside a 20 s wall-clock run
+    stored.metrics.started_at -= 20
+    stored.approvals["ship-1"].requested_at -= 10
+    store.save_run(stored)
+    done = await build({"a": make(), "ship": make(), "after": make()}, store=store).approve(run.id, "ship-1", "alice")
+    m = done.metrics
+    assert m.approval_wait_ms == pytest.approx(10_000, abs=1500)
+    assert m.e2e_latency_ms == pytest.approx(20_000, abs=1500)
+    assert m.active_ms == pytest.approx(m.e2e_latency_ms - m.approval_wait_ms)

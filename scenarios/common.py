@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from orchestrator.models import Autonomy, StageSpec
 
+TESTING_TIMEOUT_MS = 120_000  # per attempt: the real pytest subprocess must not hang the run
+
 
 def implementation_stages(parts: dict[str, str], after: str, consumes: list[str]) -> list[StageSpec]:
     """Parallel ``impl_*`` stages (``parts``: stage id -> title), all started by ``after``."""
@@ -23,7 +25,7 @@ def delivery_stages(impl_ids: list[str], docs_consumes: list[str]) -> list[Stage
         StageSpec(id="testing", title="Run the shortener test-suite and smoke test", agent="testing",
                   depends_on=["sync"], entry_gates=["implementation_complete"], exit_gates=["tests_green"],
                   max_attempts=3, fallback_agent="testing_fallback", rollback_agent="rollback_testing",
-                  parallel_group="verify", consumes=["implementation"]),
+                  parallel_group="verify", consumes=["implementation"], timeout_ms=TESTING_TIMEOUT_MS),
         StageSpec(id="documentation", title="Generate documentation", agent="documentation",
                   depends_on=["sync"], entry_gates=["implementation_complete"], exit_gates=["docs_present"],
                   parallel_group="verify", consumes=["implementation", *docs_consumes]),
