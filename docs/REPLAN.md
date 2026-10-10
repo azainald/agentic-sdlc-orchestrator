@@ -88,7 +88,9 @@ decides what else must run. That is why the human trigger needs no special graph
 | Who changed it | mandatory `actor`, validated like an approval; recorded in the decision and in telemetry |
 | Why | optional `comment`, recorded |
 | What changed | SHA-256 of the old and new requirement in the decision (the text itself is in `run.requirement`) |
-| Unsafe input | the same policy scan as artifacts; refusal is audited, run untouched |
+| Unsafe input | the same policy scan as artifacts, applied to the new requirement and to the comment; refusal is audited, run untouched. The scan is a heuristic (regular expressions and key-name matching), not a guarantee |
+| What the old text was | `old_requirement` and `new_requirement` are stored in the decision (each at most 2000 characters), next to their hashes, so the trail shows the change itself |
+| What approvers were shown | each approval request records `evidence_hashes` (artifact name to SHA-256 of what is shown), so a re-asked approval can be compared with the withdrawn one |
 | Humans stay in the loop | pending approvals are withdrawn; every gate that needs a decision on changed evidence asks again |
 | Nothing is silently stale | hash comparison, running stages re-checked on finish, lazy cascade guarded by the "ancestors settled" rule |
 | Bounded | `MAX_REPLANS`, text length cap, fails loud |
@@ -105,8 +107,10 @@ python -m scenarios amend <run_id> --requirement "..." --actor you [--comment ".
 
 It loads the run from SQLite, applies the amendment, resumes it, and prints which stages re-ran. Exit codes are the
 same as the other commands: `0` succeeded or waiting for a human, `1` failed/stopped/rolled back, `2` refused
-(unknown run, finished run, identical or empty text, reserved actor, policy violation). `status`, `resume` and
-`trace` show a `RUNS` column for re-planned runs.
+(unknown run, finished run, identical, empty or over-long text, reserved actor, policy violation in the text or the
+comment). `status`, `resume` and `amend` show a `RUNS` column (executions per stage) once any stage has run more than
+once. `trace` does not: it prints the decision lineage (`+MS KIND STAGE OUTCOME RATIONALE`), not the stage table; see
+`scenarios/report.py::stage_headers` and `format_trace`.
 
 ### HTTP API
 
@@ -127,7 +131,13 @@ the run as crashed.
 
 ## Real output: brownfield, amended while waiting at the release gate
 
-Run on a scratch SQLite file (`--skip-pytest`; paths shortened; long lines trimmed with `...`).
+Run on a scratch SQLite file (`--skip-pytest`; paths shortened; long lines trimmed with `...`). The scenario was
+re-run on 2026-10-10 against the final code. Stage states, `RUNS`, approval ids and the counts in the metrics line were
+identical to the first capture (millisecond timings differ; the `MS`, `+MS` and `e2e` figures shown are from the first
+capture). The one
+difference: the `Re-queued` list now includes `documentation`, because it is declared `reads_requirement` (its changelog
+quotes the requirement text), so it is re-queued by the amendment itself, not only if an artifact it consumes changes later; the
+lines below show the current list.
 
 ```
 $ python -m scenarios brownfield --skip-pytest --requirement "Extend the URL shortener: add custom aliases for links" --db demo.db --audit demo.jsonl
@@ -157,7 +167,7 @@ documentation      pending           1 -> 1  queued to re-run
 release            pending           0 -> 0  not run yet
 
 Re-plan lineage (decisions written by this command):
-  replan   -                  requirement_amended  requirement amended by alice: product also wants expiry. Re-queued ['requirements', 'release']; ...
+  replan   -                  requirement_amended  requirement amended by alice: product also wants expiry. Re-queued ['requirements', 'documentation', 'release']; ...
   approval release            cancelled            pending approval withdrawn: requirement amended by alice
   replan   requirements       applied              'requirements' changed ['requirements']: 'impact' consumed outdated ['requirements']; 'architecture' ...
   replan   impact             applied              'impact' changed ['impact']: 'api_change_review' consumed outdated ['impact']; 'impl_alias' ...
@@ -206,7 +216,7 @@ after the amendment, so it was **kept**. Everything else ran twice because it ge
 The decision lineage (`python -m scenarios trace run-e5bf9e31 ...`, filtered):
 
 ```
- 4349  replan    -                  requirement_amended  requirement amended by alice: product also wants expiry. Re-queued ['requirements', 'release']; ...
+ 4349  replan    -                  requirement_amended  requirement amended by alice: product also wants expiry. Re-queued ['requirements', 'documentation', 'release']; ...
  4349  approval  release            cancelled            pending approval withdrawn: requirement amended by alice
  4382  replan    requirements       applied              'requirements' changed ['requirements']: 'impact' consumed outdated ['requirements']; ...
  4418  replan    impact             applied              'impact' changed ['impact']: 'api_change_review' consumed outdated ['impact']; ...
@@ -241,6 +251,11 @@ checks, `sync` and `testing` are all kept, and only the release decision is aske
   not change). Approvals on stages that re-run are asked again. This follows the hashes, not the amendment text.
 * A withdrawn approval is stored as `rejected` by `engine` (there is no `cancelled` status); the comment and the
   `approval / cancelled` decision say why, and the CLI table prints `withdrawn`.
+* **The cap is a known limit.** `MAX_REPLANS = 3` per source stage means the fourth re-plan from the same source stage
+  (in practice the fourth amendment of one run) fails the run loudly (`stale_after_replan_limit`). That is the design,
+  chosen so a loop can never spin; a further change needs a new run. Checked by hand on 2026-10-10: four consecutive
+`amend` commands on a brownfield run paused at its first approval left it `waiting_approval` three times (new approval
+ids `api_change_review-2`, `-3`, `-4`) and ended it `failed` on the fourth, with exit code 1.
 * `metrics.replans` counts the amendment itself plus every hash-triggered re-plan pass, so one amendment shows
   `replans=3` or more, not 1.
 * Amendments are applied one after the other on the event loop. Two amendments at the same instant are both applied

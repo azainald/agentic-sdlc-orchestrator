@@ -2,7 +2,7 @@
 
 > **LLM proposes; deterministic tools verify; gates and humans decide.**
 
-The orchestrator is deterministic by default: no network, no key, 800+ tests that need neither. This document
+The orchestrator is deterministic by default: no network, no key, 1,000+ tests that need neither (1,067 pass and 2 live-model tests are skipped by default). This document
 describes an **opt-in** layer that lets a language model write four of the artifacts instead of the rule-based
 agents, while the control plane (gates, policy, approvals, retries, audit) stays exactly as it was.
 
@@ -61,7 +61,7 @@ requirement text (untrusted DATA)
 
 | Agent | Does | Guard rails |
 |---|---|---|
-| `requirements_llm` | Understands intent from raw text (paraphrases included), lists testable Given/When/Then criteria, **must** raise `open_questions` for vague text and none for clear text. | `open_questions[].resolution` is forced to `""` by the code, whatever the model wrote. No feature and no question is rejected. A clear request that the model flags is stopped by the real `ambiguity_resolved` entry gate. |
+| `requirements_llm` | Understands intent from raw text (paraphrases included), lists testable Given/When/Then criteria, **must** raise `open_questions` for vague text and none for clear text. | `open_questions[].resolution` is forced to `""` by the code, whatever the model wrote. No feature and no question is rejected. A clear request that the model flags is stopped by the real `ambiguity_resolved` entry gate. **A model may not call an explicitly vague request clear** (narrow rule below): that answer is invalid, so the engine retries and then runs the deterministic agent, which asks the human. |
 | `normalize_llm` | Proposes one bounded resolution per question. | Status stays `proposed`. Every question must be answered. The human approval stage and `apply_interpretation` are unchanged. |
 | `architecture_llm` | Components, data model, API deltas, ADR-style decisions. | Grounded components re-added if missing; ids assigned by code; `constraints` from MANIFEST. |
 | `documentation_llm` | A narrative (overview, highlights, caveats) on top of the deterministic documentation facts. | Narrative is policy-scanned as part of the artifact; files on disk are written from facts only. |
@@ -75,6 +75,20 @@ requirement text (untrusted DATA)
    change routing. Output is projected through a pydantic schema: only declared fields are read, so an
    `"approved": true` or `"skip_stages": [...]` in the answer is dropped (tested).
 3. **Schemas cap sizes**: strings 200 to 1200 characters, lists of 1 to 12 items. Over the cap is a failed attempt.
+   **No control characters**: model text ends up in terminals, reports and documents, so an answer containing any
+   control character (NUL, ESC, carriage return, backspace, the C1 range 0x7f to 0x9f) is invalid. Single-line fields
+   allow none at all; only the multi-line documentation narrative may use newline and tab. Invalid means a failed
+   attempt: retry, then the deterministic fallback (`tests/llm/test_hardening.py`). Separately, everything the CLI prints
+   goes through `safe()`, which shows a control character as a visible `\x1b`-style escape.
+   **Vague requests (a heuristic cross-check, not a guarantee).** After parsing, `requirements_llm` checks the
+   deterministic verdict (`is_explicitly_vague`): if the request has no deterministic feature match, contains an
+   explicit vague word (`safe`, `secure`, `protect`, `harden`, `better`, `improve`, `robust`, `reliable`, with their
+   endings: safer, secured, hardening, improved, ...) and the model returned zero `open_questions`, the answer is
+   invalid (`request is vague by the deterministic check but the model raised no open question`). This is deliberately
+   narrow. A vague request that uses none of those words (a paraphrase) is not covered: recognising those is what the
+   model is for, and a model that wrongly calls one clear skips the interpretation step and is only caught, if at all, by the later human
+   approvals (API change, release).
+   The rule also says nothing about whether the questions the model does raise are good ones.
 4. **Every artifact is policy-scanned by the engine**, like any other agent's output. A planted
    `password=hunter2hunter2` that an obedient model echoes is a `secret_detected` `PolicyViolation`: hard stop, no
    retry, no fallback, safe-stop of the run, and the value never appears in the decision log
@@ -102,8 +116,13 @@ LLM_ENABLED=1            # opt-in; without it every run stays deterministic
 * `python -m evals --llm` evaluates the model (`--cases N`, `--json`, `--pause SECONDS`).
 * Tests: `python -m pytest -q` never touches the network. `RUN_LIVE_LLM=1 python -m pytest tests/llm/test_live.py`
   runs the `@pytest.mark.live` tests against the real model.
-* CLI flag and API param (`llm: true`; 422 `llm_not_configured` without a key) are wired by the CLI/API owners
-  using `resolve_llm(params)` and `with_llm(scenario)`; see the hand-off notes.
+* CLI: `python -m scenarios <greenfield|brownfield|ambiguous> --llm` (wired in `scenarios/cli.py` through
+  `get_scenario(name, llm=True)`; a plain run follows `LLM_ENABLED`).
+* HTTP API: `POST /runs` with `"params": {"llm": true}` (wired in `orchestrator/api.py::create_run` through
+  `resolve_llm(params)` and `with_llm(scenario)`). `params.llm` must be the JSON value `true` or `false`; any other type
+  is `422 invalid_llm_param` (the strings `"0"` and `"false"` are truthy, so an earlier version would have switched the
+  model on for them). `true` without a configured key is `422 llm_not_configured`. The param only picks between two
+  versions of the same graph; it cannot reach the approval logic.
 
 If the key is missing, wrong, rate limited, or the model returns garbage, nothing breaks: the stage's attempts fail,
 the engine retries, and then runs the deterministic agent. Demonstrated with a deliberately invalid key against the
@@ -117,6 +136,14 @@ retry     scheduled  retrying in 50 ms
 retry     failed     attempt 2/2 with 'requirements_llm' failed: ...
 fallback  attempted  retries exhausted; trying fallback agent 'requirements'
 ```
+
+That capture was taken before the circuit breaker described next existed. With the final code, the first refused call
+(HTTP 401, 403, or 400 "API key not valid") marks the key as refused for that client: no other model is tried, and every
+later call fails immediately with `... (the API key was refused earlier; not calling the API again)` without a network
+request. So a wrong key costs one request for a whole run, not one per attempt and model. The agent registry holds one
+client, so in the CLI and in the API process the breaker stays open until the process restarts (fix the key, start a new
+process). The breaker is covered by offline tests (`tests/llm/test_client.py`, `tests/llm/test_hardening.py`); it was not
+re-checked against the real API. Other client errors (a missing model, a 5xx, a rate limit) do not open it.
 
 ## Provider and model notes
 
@@ -224,6 +251,12 @@ approvals auto-granted by the engine's demo policy, actor `auto-approver`).
 * **The model can be fluently wrong.** Schemas and gates check shape and a few semantics (e.g. that vague requests keep
   questions unresolved), not truth. The `impact` agent and the implementation checks are what keep the pipeline tied
   to the real code; the model's architecture text is not verified against it beyond the grounded component names.
+* **The vague-request check is a keyword heuristic.** It forces a model to raise questions when the request is explicitly
+  vague by the deterministic definition (no feature matched and a word such as safe, secure, protect, harden, better,
+  improve, robust or reliable present). It does not catch other vague requests and does not judge the questions the model
+  raises.
+* **A refused key needs a restart.** After one refusal the client makes no further calls (circuit breaker above), including
+  after the key is fixed in `.env`, until the process restarts.
 * **Policy false positives apply to model prose too.** The secret scanner is conservative; an innocent sentence in
   the shape `password: <6+ non-letters>` would hard-stop a run. Not seen in the real runs above.
 * **Prompt injection is mitigated, not solved.** Delimiters and instructions reduce it; the guarantee comes from the

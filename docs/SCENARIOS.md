@@ -407,6 +407,29 @@ architecture ... release   pending
 PAUSED: run run-1687ff40 is waiting for approval 'apply_interpretation-1' (requirement_interpretation) at stage 'apply_interpretation'.
 ```
 
+The review block that follows the `PAUSED:` line shows, per question, what approving would apply. This is the output of the same command re-run on 2026-10-10 after the last hardening round (run `run-957a4d9c`; the first line of each item is the question; the `approve:` lines that follow are omitted):
+
+```text
+  - Which kind of harm should the change protect against: unsafe destinations (SSRF, dangerous schemes), abuse of link creation, or visitor privacy?
+      proposed: Destination safety first: harden the SSRF and scheme guard on create and update. Abuse limits already exist (rate limiting) and are out of scope.
+      adds feature: ssrf
+      rationale: A shortener's largest exposure is redirecting people to unsafe or internal targets.
+  - Must changes to links be traceable to an actor (audit trail)?
+      proposed: Yes: an append-only audit entry for create, update and delete, with a hashed actor, never a raw key or IP. Design only in this iteration.
+      adds feature: audit
+      rationale: Safety incidents cannot be investigated without knowing who changed what.
+  - How long may click data (hashed visitor, referrer) be kept?
+      proposed: Purge clicks and deleted links older than 90 days. No change to the public API.
+      adds feature: retention
+      rationale: Click data is personal-data adjacent; a bounded window limits exposure.
+  - May existing API behaviour or response shapes change?
+      proposed: No: the change must be backward compatible and add no new endpoints.
+      adds feature: (none)
+      rationale: Existing clients must keep working without a coordinated release.
+```
+
+`adds feature` matters because approving does more than record a yes: `apply_interpretation` writes the answers in and adds those features (`ssrf`, `audit`, `retention`) to the requirement, so the approver is shown what will be added. If a run reached this approval with no proposals at all, the block would read `NOTHING TO REVIEW - approving an empty interpretation (no question or proposal exists)` instead of looking like a blank, approvable review. Every line printed here passes through `safe()`, so a control character in the requirement or in a proposal appears as a visible `\x1b`-style escape instead of acting on the terminal.
+
 Resume, as `alice`, with a comment (`resume run-1687ff40 --approve apply_interpretation-1 --actor alice --comment "bounded interpretation accepted"`):
 
 ```text
@@ -539,9 +562,9 @@ python -m scenarios amend <run_id> --requirement "..." --actor you [--comment ".
 POST /runs/{id}/amend   {"requirement": "...", "actor": "alice", "comment": "optional"}
 ```
 
-What happens: the engine validates first (a human actor, a run that is not finished or stopping, non-empty text of at most 2000 characters that differs from the current one, and the same secret and unsafe-URL scan as artifacts; a refusal leaves the run untouched, exits with code 2 and is audited without echoing the value). Then it records `replan / requirement_amended`, re-queues the root stage and every downstream stage that is not `succeeded`, withdraws the pending approvals on stages it re-queued (the approval table shows them as `withdrawn by engine`), and resumes the run. From there the normal hash comparison decides which of the stages that already succeeded must run again: a stage runs again only if an artifact it consumed changed, and a stage that re-runs and reproduces an identical artifact invalidates nothing after it (the cascade is lazy).
+What happens: the engine validates first (a human actor, a run that is not finished or stopping, non-empty text of at most 2000 characters that differs from the current one, the same secret and unsafe-URL scan as artifacts, and the same cap and scan on the `--comment`; a refusal leaves the run untouched, exits with code 2 and is audited without echoing the value). Then it records `replan / requirement_amended` (with the old and new requirement text, each bounded, and their hashes), re-queues the root stage, the stages that read the raw requirement text (`reads_requirement`: `documentation`) and every downstream stage that is not `succeeded`, withdraws the pending approvals on stages it re-queued (the approval table shows them as `withdrawn by engine`), and resumes the run. From there the normal hash comparison decides which of the stages that already succeeded must run again: a stage runs again only if an artifact it consumed changed, and a stage that re-runs and reproduces an identical artifact invalidates nothing after it (the cascade is lazy).
 
-Real run, copied from [REPLAN.md](REPLAN.md) (brownfield, `--skip-pytest`, amended while waiting at the release gate; paths shortened, long lines trimmed with `...`):
+Real run, copied from [REPLAN.md](REPLAN.md) (brownfield, `--skip-pytest`, amended while waiting at the release gate; paths shortened, long lines trimmed with `...`). It was re-run on 2026-10-10 against the final code: the stage states, the `RUNS` column, the approval ids and the counts in the metrics line are identical (millisecond timings differ); the one change from the earlier capture is that `documentation` now appears in the `Re-queued` list, because it is declared `reads_requirement`:
 
 ```text
 $ python -m scenarios brownfield --skip-pytest --requirement "Extend the URL shortener: add custom aliases for links" --db demo.db --audit demo.jsonl
@@ -571,7 +594,7 @@ documentation      pending           1 -> 1  queued to re-run
 release            pending           0 -> 0  not run yet
 
 Re-plan lineage (decisions written by this command):
-  replan   -                  requirement_amended  requirement amended by alice: product also wants expiry. Re-queued ['requirements', 'release']; ...
+  replan   -                  requirement_amended  requirement amended by alice: product also wants expiry. Re-queued ['requirements', 'documentation', 'release']; ...
   approval release            cancelled            pending approval withdrawn: requirement amended by alice
   replan   requirements       applied              'requirements' changed ['requirements']: 'impact' consumed outdated ['requirements']; 'architecture' ...
   replan   impact             applied              'impact' changed ['impact']: 'api_change_review' consumed outdated ['impact']; 'impl_alias' ...
@@ -598,7 +621,7 @@ Metrics: e2e=7775 ms, stages_ok=11, stages_failed=0, retries=0, fallbacks=0, rol
 
 `testing` has `RUNS = 1`: it consumes only the merged `implementation` artifact, which came out identical, so it was kept. Everything else genuinely depends on the requirement and ran twice. `replans=4` is the amendment itself plus three hash-triggered re-plan passes; one amendment never shows `replans=1`.
 
-Reproduced on 2026-10-10 with a different amendment ("... and show click analytics to link owners", amended while the run waited at `release-1`): `requirements`, `impact`, `architecture`, `api_change_review` and the three `impl_*` stages and `documentation` ran twice, `sync` and `testing` kept `RUNS = 1`, the new approval was `api_change_review-2` (with `[analytics]` added to the review block), and the run finished `SUCCEEDED` after `api_change_review-2` and `release-2`. Refusals, same day: amending a finished run prints `error: run 'run-957277a6' is already succeeded; start a new run instead`; a requirement containing `password=...` prints `error: policy violation: unquoted credential assignment found in artifact 'requirement' field 'requirement' (rule secret_detected); the run was not changed`; actor `engine` prints `error: actor 'engine' is reserved for the engine and cannot make human decisions`. All three exit with code 2.
+Reproduced on 2026-10-10 with a different amendment ("... and show click analytics to link owners", amended while the run waited at `release-1`): `requirements`, `impact`, `architecture`, `api_change_review` and the three `impl_*` stages and `documentation` ran twice, `sync` and `testing` kept `RUNS = 1`, the new approval was `api_change_review-2` (with `[analytics]` added to the review block), and the run finished `SUCCEEDED` after `api_change_review-2` and `release-2`. Refusals, same day: amending a finished run prints `error: run 'run-957277a6' is already succeeded; start a new run instead`; a requirement containing `password=...` prints `error: policy violation: unquoted credential assignment found in artifact 'requirement' field 'requirement' (rule secret_detected); refused, nothing was created or changed`; a requirement of 2001 characters prints `error: requirement is 2001 characters; the limit is 2000`; a `--comment "token=abcdef123456"` on `resume --approve` prints the same kind of policy error (rule and field, `'comment'`) and the approval stays pending; actor `engine` prints `error: actor 'engine' is reserved for the engine and cannot make human decisions`. All three exit with code 2.
 
 Two output details that apply to every command, not only `amend`:
 
@@ -624,7 +647,7 @@ Everything above ran deterministically: no network, no key, no model. The option
 How to switch it on:
 
 * CLI: `python -m scenarios <greenfield|brownfield|ambiguous> --llm ...`. It needs `GEMINI_API_KEY` (in the git-ignored `.env` or the environment). Setting `LLM_ENABLED=1` as well makes plain scenario commands use the model without the flag; `LLM_ENABLED=0` in the environment forces an offline run.
-* HTTP: `POST /runs` with `"params": {"llm": true}`. Without a configured key the answer is `422 llm_not_configured` (checked against a real server, no key set: `{"error":{"code":"llm_not_configured","message":"params.llm needs GEMINI_API_KEY (set it in .env)"}}`).
+* HTTP: `POST /runs` with `"params": {"llm": true}`. `params.llm` must be the JSON value `true` or `false`: a string such as `"false"` (truthy in Python) is refused with `422 invalid_llm_param`. Without a configured key `true` is refused with `422 llm_not_configured` (checked against a real server on 2026-10-10, no key set: `{"error":{"code":"llm_not_configured","message":"params.llm needs GEMINI_API_KEY (set it in .env)"}}` and `{"error":{"code":"invalid_llm_param","message":"params.llm must be the JSON value true or false"}}`).
 * Offline evaluation: `python -m evals` scores the deterministic agents on 10 labelled texts; `python -m evals --llm --pause 4` adds the model.
 
 Real run with the flag but **no key** (2026-10-10), to show that a missing key degrades instead of failing. `GEMINI_API_KEY` was set to empty for this run, so nothing left the machine (on a machine that has a key in `.env`, `LLM_PROVIDER=none` in the environment forces the same "not configured" path; checked, same result):
@@ -656,7 +679,7 @@ and the decision lineage of the same run (`python -m scenarios trace <run_id>`, 
 118  fallback  requirements  attempted  retries exhausted; trying fallback agent 'requirements'
 ```
 
-This is the engine's ordinary retry, then fallback ladder from section 4, applied to an LLM agent. The same path handles a 429 from the free tier, an outage, malformed JSON and an exit-gate failure. [LLM.md](LLM.md) shows the same thing against the real API with a deliberately invalid key (`HTTP 400 API key not valid` from Google, three retries and three fallbacks). What a model run looks like, in the numbers published in LLM.md (real run, `gemini-3.5-flash-lite`, 10 self-written cases; treat as a smoke test, not a benchmark):
+This is the engine's ordinary retry, then fallback ladder from section 4, applied to an LLM agent. The same path handles a 429 from the free tier, an outage, malformed JSON, a model answer containing a terminal control character, and an exit-gate failure. (The Gemini client additionally stops calling the API once a key has been refused, so a wrong key costs one request for the whole run. That breaker was added in the final hardening round and is covered by offline tests only, see [LLM.md](LLM.md).) [LLM.md](LLM.md) shows the same thing against the real API with a deliberately invalid key (`HTTP 400 API key not valid` from Google, three retries and three fallbacks). What a model run looks like, in the numbers published in LLM.md (real run, `gemini-3.5-flash-lite`, 10 self-written cases; treat as a smoke test, not a benchmark):
 
 | Family | Mode | N | Gate | Precision | Recall | Vague/clear correct | Policy violations |
 |---|---|--:|--:|--:|--:|--:|--:|
@@ -679,7 +702,9 @@ Some behaviours cannot be triggered from the scenarios' command line. They are c
 | Re-plan on a changed upstream artifact, the lazy cascade and the cap | Tests in `tests/orchestrator/test_engine.py` (`test_replan_*`) and `tests/orchestrator/test_amend.py`. The default scenario runs do not trigger it (`replans=0`); `amend` does, end to end in `tests/scenarios/test_amend.py` and by hand in section 5. |
 | A model cannot approve, route or smuggle fields; a prompt-injected secret is a hard stop | `tests/llm/test_scenarios_llm.py` (scripted fake model, no network): `test_a_model_cannot_approve_anything_or_alter_routing`, `test_prompt_injection_that_obeys_the_attacker_hits_the_policy_hard_stop`, `test_llm_stages_are_never_the_approval_stages`; `tests/llm/test_agents.py::test_unknown_keys_are_dropped_so_a_model_cannot_add_fields`. |
 | Timeout of an attempt | `test_agent_timeout_fails_the_attempt_and_counts_toward_retries`. The `testing` stage carries a 120 s timeout in every scenario (`test_scenario_testing_stages_have_a_timeout`). |
-| Clients cannot enable demo mode | Real server: `POST /runs` with `params.auto_approve` answers 422 `auto_approve_not_allowed`; `{"actor":"system"}` answers 422 `invalid_actor`. Tests: `test_client_cannot_enable_auto_approve_through_run_params`, `test_reserved_actor_names_cannot_approve_or_reject_over_http`. |
+| A model may not call "Make links safer" clear; a model answer with control characters is rejected | Scripted fake model, no network: `tests/llm/test_hardening.py::test_a_model_that_calls_a_vague_request_clear_cannot_skip_the_human_interpretation_approval` (the run still pauses at `requirement_interpretation`), `::test_requirements_llm_rejects_control_characters_anywhere`, `::test_a_model_that_answers_with_escape_sequences_degrades_to_the_deterministic_fallback`. The vague-request rule is a keyword heuristic (no deterministic feature, an explicit vague word, zero open questions), not a guarantee. |
+| A requirement or a comment with a secret, or an over-long requirement | Real CLI and real server on a scratch database (section 5 and README): exit code 2 or HTTP 422, no run created or the run unchanged. Tests: `tests/orchestrator/test_governance.py`, `tests/orchestrator/test_api_governance.py`, `tests/scenarios/test_report_safety.py`. |
+| Clients cannot enable demo mode | Real server (no authentication on it; it was bound to loopback): `POST /runs` with `params.auto_approve` answers 422 `auto_approve_not_allowed`; `{"actor":"system"}` answers 422 `invalid_actor`. Tests: `test_client_cannot_enable_auto_approve_through_run_params`, `test_reserved_actor_names_cannot_approve_or_reject_over_http`. |
 | A run survives an orchestrator restart | Real server: created a brownfield run over HTTP, approved the first checkpoint, killed the server process, restarted it; `GET /runs/{id}` still showed `waiting_approval` with `release-1` pending, and approving it finished the run `succeeded`. Test: `test_run_survives_restart_via_shared_store`. |
 
 One observation from that restart: the telemetry half of `/runs/{id}/trace` held only the new process's 9 events while the `decisions` list held all 66. The decision lineage and `data/audit.jsonl` keep the full history; the in-memory event log restarts. At the time, `GET /metrics` also restarted from zero (`runs_started: 0` with `runs_succeeded: 1`). That has since been changed: the API now rebuilds the aggregate counters from the stored runs at start-up (`replay_runs`), and a restart of a server on a database holding one finished run reported `runs_started: 1, runs_succeeded: 1` while its `/trace` had 0 events and 111 decisions. Only the event log is lost.

@@ -36,25 +36,30 @@ $env:PYTHONWARNINGS = "ignore"   # hides a harmless Starlette deprecation warnin
 > I drove a real URL shortener through three scenarios: a clear greenfield request, a
 > brownfield change with impact analysis and an API-change approval, and an ambiguous request,
 > "make links safer", that has to be interpreted and approved before any design happens. The
-> agents are deterministic by default, so the engine is testable: 996 tests that need no
-> network, with failure injection built in. There is an optional Gemini layer for four of the
+> agents are deterministic by default, so the engine is testable: 1,067 passing tests that
+> need no network, with failure injection built in. There is an optional Gemini layer for four of the
 > artifacts, behind a flag, with the deterministic agent as the fallback; the principle is
 > that the LLM proposes, deterministic tools verify, and gates and humans decide. The build
 > was AI-assisted, and I used an independent review agent on the first build that found 12
-> defects, 9 reproduced, all fixed with regression tests. I will also tell you what it does
+> findings, 9 reproduced; 10 were fixed with regression tests and 2 documented as known limits. I will also tell you what it does
 > not do: nothing writes product code, the LLM evals are 10 cases I wrote myself, there is no
-> approver authentication, and it is single-process.
+> authentication at all (approver names are just strings the caller supplies), the Docker
+> image was never built, and it is single-process.
 
 ## 2. Demo script (about ten minutes, plus optional steps)
 
 Setup before the interview (not in the clock):
 
+Open PowerShell in the repository root (the folder that contains `README.md`), then:
+
 ```powershell
-cd C:\Users\ahmed\Desktop\job-agentic
 Remove-Item data\*.db*, data\*.jsonl -ErrorAction SilentlyContinue
 Remove-Item -Recurse docs\generated -ErrorAction SilentlyContinue
-& $py -m pytest -q -W ignore          # expect: 996 passed, 2 skipped (about 40 s). Do this earlier, not live.
+& $py -m pytest -q -W ignore          # expect: 1067 passed, 2 skipped (about 50 s). Do this earlier, not live.
 ```
+
+The two `Remove-Item` lines delete only the demo state (`data\*.db*`, `data\*.jsonl`) and the generated
+documents; skip them if you want to keep earlier runs.
 
 The 2 skipped tests are the live-model tests (`RUN_LIVE_LLM=1` plus a key). Everything else is offline,
 and `tests/conftest.py` forces `LLM_ENABLED=0`. If your `.env` has `LLM_ENABLED=1`, plain
@@ -202,7 +207,10 @@ the merged implementation, came out identical, so they were kept) while the othe
 Show the refusals (each exits with code 2 and leaves the run untouched): amend the now finished
 run (`error: run '...' is already succeeded; start a new run instead`), use actor `engine`
 (`reserved for the engine`), and put `password=hunter2hunter2` in the requirement
-(`policy violation ... the run was not changed`). Clean up with
+(`error: policy violation: unquoted credential assignment found in artifact 'requirement' field 'requirement' (rule secret_detected); refused, nothing was created or changed`).
+The same scan also refuses a secret in a `--comment` on `amend` or `resume` (the approval stays
+pending) and in the `--requirement` of a brand-new run, and a requirement over 2000 characters is
+refused everywhere (`requirement is 2001 characters; the limit is 2000`). Clean up with
 `Remove-Item data\demo.db*, data\demo.jsonl`.
 
 ### Step 5 (1 min): ambiguity
@@ -213,9 +221,12 @@ run (`error: run '...' is already succeeded; start a new run instead`), use acto
 
 Expected: `WAITING_APPROVAL` at `apply_interpretation` (`requirement_interpretation: pending`);
 design stages still `pending`; the `PAUSED` block shows each open question with the proposed
-answer (four questions: scope with SSRF first, accountability with audit as design only, privacy
+answer, the feature that approving it adds (`adds feature: ssrf`, `audit`, `retention`, `(none)`) and the
+rationale (four questions: scope with SSRF first, accountability with audit as design only, privacy
 with 90-day retention, compatibility with backward compatible). Say: "The agents propose, a human decides, and the `ambiguity_resolved` gate
-keeps architecture closed until then." Leave it paused or approve it.
+keeps architecture closed until then. Approving is not a rubber stamp: it adds those features, so the
+review text shows them." (If there were nothing to review, the block would say `NOTHING TO REVIEW`.)
+Leave it paused or approve it.
 
 ### Step 6 (1 min): metrics
 
@@ -232,7 +243,9 @@ explain how."
 
 Terminal A: `& $py -m orchestrator` (serves http://127.0.0.1:8090). Open `/docs`.
 
-Terminal B (PowerShell 5.1 quoting; if it misbehaves, do the same in the Swagger UI at `/docs`):
+Terminal B (PowerShell 5.1 quoting; the two commands below work as written, but a JSON value that
+contains spaces, such as `"comment":"reviewed API deltas"`, is mangled by `curl.exe` there and gives a
+`JSON decode error`. For those use `Invoke-RestMethod` as in the README, or the Swagger UI at `/docs`):
 
 ```powershell
 curl.exe -s -X POST "http://127.0.0.1:8090/runs?wait=true" -H "content-type: application/json" -d '{\"scenario\":\"brownfield\",\"params\":{\"skip_pytest\":true}}'
@@ -250,7 +263,10 @@ Expected: first returns a run view with `"state":"waiting_approval"` and a pendi
 Stop the server with Ctrl+C. Clean up afterwards with the two `Remove-Item` lines from the setup.
 Over HTTP the same amendment is `POST /runs/<id>/amend` with `{"requirement": "...", "actor": "alice"}`
 (`?wait=true` returns the settled run); `params: {"llm": true}` on `POST /runs` answers
-`422 llm_not_configured` when no key is set.
+`422 llm_not_configured` when no key is set, and `{"llm": "false"}` (a string) answers
+`422 invalid_llm_param`. Say plainly: "There is no authentication on this API. Anyone who can reach
+the port can approve; it binds to loopback, and the compose file (never built into an image) publishes on loopback only. The
+`alice` in the trail is whatever the caller typed."
 
 ### Step 8 (optional, 2 min): the LLM layer and its fallback
 
@@ -307,14 +323,14 @@ I wrote myself, so it is a smoke test and not a benchmark.
     `orchestrator/agents/llm_agents.py`, `orchestrator/llm/`, `scenarios/common.py::llm_graph`
     and `tests/llm/test_scenarios_llm.py`.
 
-## 4. The sixteen most likely questions
+## 4. The seventeen most likely questions
 
 ### 1. Why a custom engine instead of LangGraph (or Temporal, or Airflow)?
 
 The semantics I needed are specific: entry and exit gates per stage, `join=any`, re-plan when an
 input artifact's hash changes, approvals that pause the run and survive a restart, and
 fail-closed policy. I would have had to write those on top of a framework anyway, and I
-wanted something small enough (about 840 lines) that I can explain every line and test it
+wanted something small enough (869 lines including docstrings) that I can explain every line and test it
 deterministically (injected `sleep`, plain functions as agents). The cost is that I own
 durability, distribution and UI. If this went to production I would look at a durable-execution
 system and keep this model as the definition layer; the `RunStore` and `TelemetrySink`
@@ -337,10 +353,16 @@ Layers, from the outside in:
   human decisions, in the engine, CLI and API.
 - Entry gates are re-checked after approval, so evidence that changed during the wait still
   blocks the stage.
+- What the approver reads is the real thing: the review text shows, per proposed interpretation, the
+  feature that approving it adds and the rationale; the approval request records the hashes of the
+  evidence shown (`evidence_hashes`); terminal output has control characters neutralised so text
+  cannot redraw the screen; approval comments are scanned and bounded like the requirement.
 
 What it does not do **(know this)**: the actor is a string the caller supplies, there is no
-login, and the engine cannot enforce that the approver is not the requester. That needs an
-identity provider in front of the API (stated in `validate_human_actor`).
+login (no authentication on any endpoint, so anyone who can reach the port can approve), and the
+engine cannot enforce that the approver is not the requester. That needs an
+identity provider in front of the API (stated in `validate_human_actor`). The mitigation here is
+only that the servers bind to loopback and the compose file (never built) publishes on loopback only.
 Files: `orchestrator/policy.py`, `engine.py` (`_request_approval`, `_human`), `api.py` (`create_run`, `decide`).
 
 ### 3. What happens if the process dies mid-run?
@@ -433,11 +455,19 @@ Same signature, `AgentContext -> AgentResult`: `requirements_llm`, `normalize_ll
    retry then fallback ladder (policy forbids a fallback on approval-gated stages, on purpose,
    and the LLM swap never touches an approval stage).
 5. **Bounds.** `timeout_ms` 120 s, at least 2 attempts, low temperature, a token cap; no tools; the
-   requirement is untrusted delimited data (question 14).
+   requirement is untrusted delimited data (question 14). An answer containing a control character
+   (ESC, carriage return, backspace, the C1 range) is invalid, so it takes the retry then fallback path.
+   `requirements_llm` also may not call an explicitly vague request clear (below).
 6. **Provenance.** Every LLM-touched artifact records `generator: llm:<model>` or `deterministic`;
    the report shows `(fallback)` when the deterministic agent answered.
 7. **Evals.** `python -m evals` compares deterministic and LLM agents on 10 labelled texts.
 8. Humans stay on high-impact stages.
+The vague-request cross-check **(know this)**: if the deterministic detector finds no feature and an
+explicit vague word (safe, secure, protect, harden, better, improve, robust, reliable) in the request,
+and the model returned zero open questions, the answer is invalid and the deterministic agent runs
+(which asks the human). That stops a model from switching ambiguity detection off for "Make links
+safer". It is a narrow keyword heuristic, not a guarantee: a vague request with none of those words
+is not covered, and it does not judge whether the model's questions are good.
 Not done **(know this)**: token and cost budgets, prompt version and model parameters in the
 decision lineage (only the model name is recorded), more than one provider, a held-out eval
 set. Details: `docs/LLM.md`.
@@ -487,17 +517,20 @@ Files: `shortener/validation.py`, `shortener/service.py` (`create`, `_replay`), 
 
 ### 10. What is the testing strategy?
 
-A pyramid, 998 collected, 996 pass and 2 live-model tests are skipped, about 40 seconds:
-608 unit (policy has 320 mostly parametrised bypass attempts; validation 106; the LLM client,
-settings and eval scoring 79), 100 engine component tests with stub agents (parallelism, join,
-retry, fallback, rollback, stop, restart with a new `Engine`, re-plan, timeouts, and 31 for
-requirement amendment), 144 HTTP tests across both APIs, 38 agent tests against the real
-shortener, 21 LLM-agent tests on a scripted fake model, 51 scenario integration tests (including
-5 amend runs with real agents and 14 whole scenarios with a scripted model), 34 CLI tests.
+A pyramid, 1,069 collected, 1,067 pass and 2 live-model tests are skipped, 48 seconds on the day I
+measured it:
+623 unit (policy has 320 mostly parametrised bypass attempts; validation 106; the LLM client,
+settings and eval scoring 94), 110 engine component tests with stub agents (parallelism, join,
+retry, fallback, rollback, stop, restart with a new `Engine`, re-plan, timeouts, 31 for
+requirement amendment and 10 for the governance hardening), 161 HTTP tests across both APIs
+(17 of them for the strict `llm` param and scanned requirements and comments), 38 agent tests against the real
+shortener, 36 LLM-agent tests on a scripted fake model (15 of them hardening), 52 scenario integration tests (including
+5 amend runs with real agents and 15 whole scenarios with a scripted model), 41 CLI and report tests,
+6 text-level checks of the deployment files, and the 2 live tests.
 Failure injection is part of the product (`inject_failure`). One slow test runs the real pytest
 subprocess. The suite never touches the network: `tests/conftest.py` forces `LLM_ENABLED=0`, and
-`ScriptedLLM` replays canned answers and records prompts. CI config runs Python 3.10 and 3.12
-and a scenario smoke run.
+`ScriptedLLM` replays canned answers and records prompts. The CI config runs Python 3.10 and 3.12
+and a scenario smoke run with a read-only token; the workflow itself could not be run here, only its commands locally, and the local environment is Python 3.10.11 (so the 3.12 leg of the matrix is not confirmed here).
 Determinism: injected `sleep` and clocks, so no test waits on real time except where overlap is
 being proven. Beyond that, an independent review caught what tests written alongside the code
 had missed (question 11).
@@ -506,7 +539,8 @@ Files: `tests/orchestrator/test_engine.py`, `tests/scenarios/test_scenarios.py`,
 ### 11. What did the AI get wrong that you caught?
 
 I did not rely on the builders' own tests. An independent read-only review agent reported 12
-defects; 9 were reproduced; all were fixed with regression tests. The ones to talk about:
+findings; 9 were reproduced and 3 suspected; 10 were fixed with regression tests and 2 were
+documented as known limits. A second review of the later features (amend, LLM layer, packaging) found more; the code issues were fixed with tests, and the amendment cap was kept as documented design. The ones to talk about:
 - **auto_approve bypass**: approvals could be switched off by something a client controls. Now
   engine-only, API-rejected, reserved actor names.
 - **Policy bypasses**: secrets and unsafe URLs getting past the scanners through key-name
@@ -565,6 +599,10 @@ I do not claim to stop it; I limit what it can do. Layers:
 5. **Gates and humans.** A clear request that the model wrongly flags as vague is stopped by the real
    `ambiguity_resolved` gate; the LLM stages are never approval stages; approvals come only from
    `Engine.approve` or `reject`.
+6. **No control characters, and no "clear" for an explicitly vague request.** Model output containing a
+   terminal control character is invalid (retry, then fallback), and the CLI prints everything through
+   `safe()`. A model cannot answer "clear" for a request that has an explicit vague word and no
+   deterministic feature (keyword heuristic, see question 7).
 Honest limit **(know this)**: a manipulated model can still produce a misleading but harmless-looking
 requirement; a human reviews the approval stages, and the key hygiene (header only, scrubbed from error
 text, `.env` git-ignored) is separate from this. In the eval, the injection case made the deterministic
@@ -587,19 +625,34 @@ left it out.
 - **Selective, not "re-run everything"**: roots re-run, and the normal hash comparison decides the rest
   (lazy cascade). In the real brownfield demo `testing` kept `RUNS 1` because its input was identical.
 - **Bounded**: the 2000 character cap and `MAX_REPLANS` per source stage; past it the run fails loudly.
+- **Text that can lie is scanned**: the comment on an amendment (and on every approve or reject) gets the
+  same 2000-character cap and secret and unsafe-URL scan; so does the requirement of a brand-new run.
+- **Nothing is lost in the trail**: the amendment decision stores the old and the new requirement text
+  (bounded) and their hashes, and each approval request stores the hashes of the evidence shown.
+- **Stages that read the raw text re-run**: `documentation` (its changelog quotes the requirement) and, in the
+  ambiguous scenario, `normalize` are declared `reads_requirement`, so an amendment re-runs them even if
+  every artifact they consume is unchanged; the hash comparison cannot see text they read directly.
 Honest limits **(know this)**: the actor is an unauthenticated string so "the amender is not the approver"
 cannot be enforced; a running stage cannot be interrupted, so one amendment can cost one wasted
 execution; whole-artifact hashing re-runs more than strictly needed; a withdrawn approval is stored as
-`rejected`, there is no `cancelled` status.
-Tests: `tests/orchestrator/test_amend.py` (31), `tests/scenarios/test_amend.py` (5). Files: `docs/REPLAN.md`.
+`rejected`, there is no `cancelled` status. **A known cap**: `MAX_REPLANS = 3` per source stage, so
+the fourth amendment of the same run (the fourth re-plan from the same source stage) fails the run loudly
+with `stale_after_replan_limit`; that is the documented design to prevent endless loops, not a bug, and an
+operator who needs a fourth change has to start a new run.
+Tests: `tests/orchestrator/test_amend.py` (31), `tests/scenarios/test_amend.py` (5),
+`tests/orchestrator/test_governance.py` (10), including
+`test_replan_cap_fails_the_run_loudly_when_a_requirement_is_amended_too_often`. Files: `docs/REPLAN.md`.
 
 ### 16. What if Gemini is down, or rate limited?
 
 The run still finishes, deterministically. The LLM stage is configured with the LLM agent first and the
 deterministic agent as `fallback_agent`, with at least 2 attempts and a 120 s timeout. A 429 (after the
 client's own short retries, at most 2 per model with `Retry-After` honoured up to 20 s, then the next model
-in a short list), an outage, an invalid key, malformed JSON or a failed exit gate is a failed attempt: the
-engine retries with backoff, then runs the deterministic agent. Everything is in the audit trail.
+in a short list), an outage, an invalid key, malformed JSON, a model answer containing a control character or
+a failed exit gate is a failed attempt: the engine retries with backoff, then runs the deterministic agent.
+Everything is in the audit trail. A refused key (401, 403 or 400 "API key not valid") is treated as permanent:
+the client tries no other model and then makes no further network calls at all (a small circuit breaker), so a
+bad key costs one request, not several per stage; fixing it means starting a new process.
 I can show it live with no key: `$env:LLM_PROVIDER = "none"` and `--llm` give `retries=3 fallbacks=3` and
 `Generators: ... (fallback)` (real output in `docs/SCENARIOS.md` section 6); `docs/LLM.md` shows the same
 against the real API with a deliberately invalid key (`HTTP 400 API key not valid`).
@@ -608,6 +661,28 @@ run than an unlimited one; LLM runs are nondeterministic, so artifact hashes dif
 for an LLM stage where it would not for a deterministic one.
 Tests: `tests/llm/test_scenarios_llm.py::test_garbage_output_is_retried_then_falls_back_to_the_deterministic_agent`,
 `::test_an_unavailable_model_degrades_to_exactly_the_offline_result`.
+
+### 17. What did the last hardening round change, and what is still weak?
+
+A final review of the finished system produced one more round of fixes, each with regression tests
+(`test_governance.py`, `test_api_governance.py`, `test_report_safety.py`, `test_hardening.py`,
+`test_packaging.py`):
+- The requirement (capped at 2000 characters) and every approve, reject and amend comment are policy-scanned
+  before use. A refusal creates no run, or leaves the run unchanged and records a `policy` decision
+  (rule and field, never the value) where a run exists.
+- The approver's review text shows `adds feature` and `rationale` per proposed interpretation, because
+  approving adds that feature, and says `NOTHING TO REVIEW` when empty. Approval requests record
+  `evidence_hashes`; amendment decisions record the old and new text.
+- Every terminal print neutralises control characters; model output with one is invalid (retry, then
+  fallback). A model cannot call an explicitly vague request clear (keyword heuristic).
+- `params.llm` must be a JSON boolean (`invalid_llm_param`) and needs a configured key
+  (`llm_not_configured`): `"false"` used to be a truthy string that switched the model on.
+- A refused Gemini key trips a circuit breaker. Documentation (and `normalize` in the ambiguous
+  scenario) re-runs on an amendment through `reads_requirement`.
+- The compose file (image never built) publishes on loopback only, the CI token is read-only, `requirements-lock.txt` pins the 6
+  direct dependencies.
+Still weak **(know this)**: no authentication anywhere; heuristic scanning; nothing records the live model runs being repeated after this
+round; Docker image never built; CI not run on a real runner; the fourth amendment of one run fails it.
 
 ## 5. Glossary (plain English)
 
@@ -631,7 +706,8 @@ Tests: `tests/llm/test_scenarios_llm.py::test_garbage_output_is_retried_then_fal
 - **Rollback**: an agent that undoes or withdraws what a failed stage left behind. Here the
   effects are small, so rollbacks are mostly symbolic.
 - **Safe-stop**: stop starting new work; let what is running finish; skip the rest; end as
-  `STOPPED`. Triggered by a person or automatically by a policy violation.
+  `STOPPED` (or `FAILED` when a stage failed, which is what a policy violation gives). Triggered by a
+  person or automatically by a policy violation.
 - **Approval**: a pause where a named human says yes or no. The run is saved and can resume
   in another process.
 - **Re-plan**: when an input changed after someone used it, re-run that stage (capped at 3 per
@@ -656,9 +732,23 @@ Tests: `tests/llm/test_scenarios_llm.py::test_garbage_output_is_retried_then_fal
   one. Not covered here because the guard does not resolve DNS.
 - **MTTR (mean time to recovery)**: the average time from the first sign of trouble to the
   run succeeding anyway. Approximate here (question 5).
-- **Audit trail**: the permanent record of what happened and why: decision records on the run
-  plus an append-only JSONL file.
+- **Audit trail**: the record of what happened and why: decision records on the run plus an
+  append-only JSONL file. Honest qualifiers: the names in it are caller-supplied strings, and the file
+  is append-only by convention only (nothing signs or protects it).
 - **Active time**: end-to-end time minus time spent waiting for humans.
+- **Control character**: a non-printing character such as ESC (starts an ANSI sequence), carriage return
+  or backspace. Printed raw they can redraw or overwrite what a reviewer sees, so the CLI prints them as
+  visible escapes (`\x1b`) and rejects model output that contains them.
+- **Evidence hashes**: the SHA-256 of each artifact an approver is shown, stored on the approval request,
+  so "what exactly was approved" can be reconstructed from the trail.
+- **`reads_requirement`**: a stage flag meaning the agent reads the raw requirement text, not only
+  artifacts. An amendment re-runs such a stage even when its artifacts are unchanged.
+- **Circuit breaker**: after the model provider refuses the API key, the client stops calling it instead
+  of retrying on every stage.
+- **Heuristic cross-check**: a keyword rule used as a second opinion (here, a model may not call a request
+  with an explicit vague word "clear"). It catches the common case and is not a guarantee.
+- **Loopback**: `127.0.0.1`, reachable only from the same machine. The API has no authentication, so
+  that is where it is bound.
 
 ## 6. Seven honest weaknesses to volunteer
 
@@ -673,11 +763,13 @@ Say these before they are found. Pattern: what it is, why I accepted it, what I 
    deterministic fallback. Its evals are 10 cases I wrote, so 100% is a smoke test; it is
    nondeterministic, rate limited on the free tier, and only Gemini is implemented. The next
    step is a held-out eval set and cost budgets."
-2. **There is no authentication for approvers.**
-   "The approver is a name the caller supplies. The engine blocks blank and machine names and
-   records who decided, but it cannot prove identity or that the approver differs from the
-   requester. That belongs to an identity provider in front of the API; I documented it in
-   `validate_human_actor` instead of pretending."
+2. **There is no authentication at all.**
+   "No endpoint checks who is calling, so anyone who can reach the port can approve a release. The
+   approver and amender are names the caller supplies; the engine blocks blank and machine names
+   and records who decided, but it cannot prove identity or that the approver differs from the
+   requester. The audit file is append-only by convention, not tamper-evident. I bind to loopback
+   and publish the compose ports on loopback only (the image was never built), and that is all. An identity provider in front of
+   the API is the real fix; I documented the gap in `validate_human_actor` instead of pretending."
 3. **It is single-process and only as durable as one SQLite writer.**
    "There is no compare-and-swap, so two processes resuming one run is unsafe. After a
    restart, an in-flight approval-gated stage asks for approval again, and the HTTP API has no
@@ -690,17 +782,24 @@ Say these before they are found. Pattern: what it is, why I accepted it, what I 
    failure timestamp and critical-path tracking."
 5. **The analysis and guards are heuristics.**
    "Requirement understanding is a keyword table, the impact call graph matches calls by
-   name (an over-approximation), the secret scanner is pattern-based, and the SSRF guard does
-   not resolve DNS. Each is tested against bypass attempts, but none is complete; they are the
-   first layer, and the manifest and docstrings list the known gaps."
-
-6. **Re-plan is only as precise as `consumes`.**
+   name (an over-approximation), the secret scanner (which also scans requirements and comments)
+   is pattern-based, the check that stops a model calling an explicitly vague request clear is a
+   keyword rule, and the SSRF guard does not resolve DNS. Each is tested against bypass attempts,
+   but none is complete; they are the first layer, and the manifest and docstrings list the
+   known gaps."
+6. **Re-plan is only as precise as `consumes`, and it is capped.**
    "Artifacts are hashed as a whole, so a stage that reads one field re-runs when any field
    changes, and a running stage cannot be interrupted, so an amendment can cost one wasted
-   execution. Both err toward re-running, never toward stale results. Field-level
-   dependencies and cancellable execution are the fix."
-7. **The Docker files are unvalidated.**
-   "They exist, but I never built or ran them, so I do not claim they work."
+   execution. Provided `consumes` lists everything a stage reads (I checked the shipped
+   scenarios), both err toward re-running; a stage that read an artifact it did not declare
+   would be kept stale. `reads_requirement` covers the raw requirement text. The fourth
+   re-plan from the same source stage fails the run by design. Field-level dependencies and
+   cancellable execution are the fix."
+7. **The Docker image and the CI workflow were never run.**
+   "The Dockerfile and compose file exist, but the image was never built because no Docker
+   daemon was available, so I do not claim they work; only text-level checks run in the test
+   suite. The CI workflow could not be run here either, only its commands locally. The lock file
+   pins the 6 direct dependencies but not their transitive ones."
 
 Also be ready to say, if asked about gaps in the model: `parallel_group` and the `full` versus
 `supervised` autonomy levels are informational, and the `no_policy_exceptions` gate always

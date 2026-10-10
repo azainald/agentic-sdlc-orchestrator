@@ -1073,6 +1073,7 @@
             "anyOf": [
               {
                 "type": "string",
+                "maxLength": 2000,
                 "minLength": 1
               },
               {
@@ -1699,6 +1700,11 @@
             },
             "type": "array",
             "title": "Consumes"
+          },
+          "reads_requirement": {
+            "type": "boolean",
+            "title": "Reads Requirement",
+            "default": false
           },
           "timeout_ms": {
             "anyOf": [
