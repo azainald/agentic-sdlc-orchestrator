@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+data/*.db
+data/*.json
+*.egg-info/
+.env
+
+# assignment brief is confidential - never commit
+*.pdf
