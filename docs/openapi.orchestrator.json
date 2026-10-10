@@ -1,0 +1,1727 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Agentic SDLC Orchestrator",
+    "description": "Start scenario runs, approve gated stages, stop runs, and inspect their DAG, trace and metrics.",
+    "version": "1.0.0"
+  },
+  "paths": {
+    "/health": {
+      "get": {
+        "tags": [
+          "system"
+        ],
+        "summary": "Health",
+        "operationId": "health_health_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/scenarios": {
+      "get": {
+        "tags": [
+          "scenarios"
+        ],
+        "summary": "List Scenarios",
+        "description": "Every runnable scenario with its explicit stage graph.",
+        "operationId": "list_scenarios_scenarios_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/ScenarioView"
+                  },
+                  "type": "array",
+                  "title": "Response List Scenarios Scenarios Get"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/runs": {
+      "post": {
+        "tags": [
+          "runs"
+        ],
+        "summary": "Create Run",
+        "operationId": "create_run_runs_post",
+        "parameters": [
+          {
+            "name": "wait",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "description": "Block until the run is terminal or waiting for approval",
+              "default": false,
+              "title": "Wait"
+            },
+            "description": "Block until the run is terminal or waiting for approval"
+          },
+          {
+            "name": "timeout",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "number",
+              "maximum": 600,
+              "minimum": 0,
+              "description": "Max seconds to block when wait=true",
+              "default": 30.0,
+              "title": "Timeout"
+            },
+            "description": "Max seconds to block when wait=true"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateRunRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Run created and started in the background",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunAccepted"
+                }
+              }
+            }
+          },
+          "200": {
+            "description": "With wait=true: the run once settled (or on timeout)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunView"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Invalid request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      },
+      "get": {
+        "tags": [
+          "runs"
+        ],
+        "summary": "List Runs",
+        "description": "Newest first.",
+        "operationId": "list_runs_runs_get",
+        "parameters": [
+          {
+            "name": "state",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "$ref": "#/components/schemas/RunState"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Filter by run state",
+              "title": "State"
+            },
+            "description": "Filter by run state"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/RunSummary"
+                  },
+                  "title": "Response List Runs Runs Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/runs/{run_id}": {
+      "get": {
+        "tags": [
+          "runs"
+        ],
+        "summary": "Get Run",
+        "operationId": "get_run_runs__run_id__get",
+        "parameters": [
+          {
+            "name": "run_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Run Id"
+            }
+          },
+          {
+            "name": "include_content",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "description": "Include artifact bodies",
+              "default": false,
+              "title": "Include Content"
+            },
+            "description": "Include artifact bodies"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunView"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown run, approval or scenario",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/runs/{run_id}/approvals/{approval_id}/approve": {
+      "post": {
+        "tags": [
+          "approvals"
+        ],
+        "summary": "Approve",
+        "description": "Approve a pending approval. ``actor`` is mandatory: every decision is attributed.",
+        "operationId": "approve_runs__run_id__approvals__approval_id__approve_post",
+        "parameters": [
+          {
+            "name": "run_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Run Id"
+            }
+          },
+          {
+            "name": "approval_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Approval Id"
+            }
+          },
+          {
+            "name": "wait",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "description": "Block until the run is terminal or waiting for approval",
+              "default": false,
+              "title": "Wait"
+            },
+            "description": "Block until the run is terminal or waiting for approval"
+          },
+          {
+            "name": "timeout",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "number",
+              "maximum": 600,
+              "minimum": 0,
+              "description": "Max seconds to block when wait=true",
+              "default": 30.0,
+              "title": "Timeout"
+            },
+            "description": "Max seconds to block when wait=true"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ApprovalDecision"
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Decision accepted; the run resumes in the background",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApprovalAccepted"
+                }
+              }
+            }
+          },
+          "200": {
+            "description": "With wait=true: the run once settled (or on timeout)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunView"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown run, approval or scenario",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "State conflict",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Invalid request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/runs/{run_id}/approvals/{approval_id}/reject": {
+      "post": {
+        "tags": [
+          "approvals"
+        ],
+        "summary": "Reject",
+        "description": "Reject a pending approval: the gated stage fails and its dependents are skipped.",
+        "operationId": "reject_runs__run_id__approvals__approval_id__reject_post",
+        "parameters": [
+          {
+            "name": "run_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Run Id"
+            }
+          },
+          {
+            "name": "approval_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Approval Id"
+            }
+          },
+          {
+            "name": "wait",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "description": "Block until the run is terminal or waiting for approval",
+              "default": false,
+              "title": "Wait"
+            },
+            "description": "Block until the run is terminal or waiting for approval"
+          },
+          {
+            "name": "timeout",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "number",
+              "maximum": 600,
+              "minimum": 0,
+              "description": "Max seconds to block when wait=true",
+              "default": 30.0,
+              "title": "Timeout"
+            },
+            "description": "Max seconds to block when wait=true"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ApprovalDecision"
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Decision accepted; the run resumes in the background",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApprovalAccepted"
+                }
+              }
+            }
+          },
+          "200": {
+            "description": "With wait=true: the run once settled (or on timeout)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunView"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown run, approval or scenario",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "State conflict",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Invalid request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/runs/{run_id}/stop": {
+      "post": {
+        "tags": [
+          "runs"
+        ],
+        "summary": "Stop Run",
+        "description": "Safe-stop: in-flight stages finish, everything not started is skipped.",
+        "operationId": "stop_run_runs__run_id__stop_post",
+        "parameters": [
+          {
+            "name": "run_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Run Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunView"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown run, approval or scenario",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "State conflict",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/runs/{run_id}/trace": {
+      "get": {
+        "tags": [
+          "runs"
+        ],
+        "summary": "Get Trace",
+        "description": "Audit events (telemetry) plus the decision lineage stored on the run.",
+        "operationId": "get_trace_runs__run_id__trace_get",
+        "parameters": [
+          {
+            "name": "run_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Run Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TraceView"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown run, approval or scenario",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/runs/{run_id}/dag": {
+      "get": {
+        "tags": [
+          "runs"
+        ],
+        "summary": "Get Dag",
+        "description": "Nodes with their current state, and dependency edges (source runs before target).",
+        "operationId": "get_dag_runs__run_id__dag_get",
+        "parameters": [
+          {
+            "name": "run_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Run Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DagView"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown run, approval or scenario",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/metrics": {
+      "get": {
+        "tags": [
+          "system"
+        ],
+        "summary": "Get Metrics",
+        "operationId": "get_metrics_metrics_get",
+        "parameters": [
+          {
+            "name": "format",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "enum": [
+                "json",
+                "prometheus"
+              ],
+              "type": "string",
+              "default": "json",
+              "title": "Format"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "JSON snapshot, or Prometheus text with ?format=prometheus",
+            "content": {
+              "application/json": {
+                "schema": {}
+              },
+              "text/plain": {}
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "Approval": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "run_id": {
+            "type": "string",
+            "title": "Run Id"
+          },
+          "stage_id": {
+            "type": "string",
+            "title": "Stage Id"
+          },
+          "kind": {
+            "type": "string",
+            "title": "Kind"
+          },
+          "status": {
+            "$ref": "#/components/schemas/ApprovalStatus",
+            "default": "pending"
+          },
+          "requested_at": {
+            "type": "number",
+            "title": "Requested At"
+          },
+          "resolved_at": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Resolved At"
+          },
+          "actor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Actor"
+          },
+          "comment": {
+            "type": "string",
+            "title": "Comment",
+            "default": ""
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "run_id",
+          "stage_id",
+          "kind"
+        ],
+        "title": "Approval"
+      },
+      "ApprovalAccepted": {
+        "properties": {
+          "run_id": {
+            "type": "string",
+            "title": "Run Id"
+          },
+          "approval_id": {
+            "type": "string",
+            "title": "Approval Id"
+          },
+          "decision": {
+            "$ref": "#/components/schemas/ApprovalStatus"
+          },
+          "actor": {
+            "type": "string",
+            "title": "Actor"
+          },
+          "links": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object",
+            "title": "Links"
+          }
+        },
+        "type": "object",
+        "required": [
+          "run_id",
+          "approval_id",
+          "decision",
+          "actor",
+          "links"
+        ],
+        "title": "ApprovalAccepted"
+      },
+      "ApprovalDecision": {
+        "properties": {
+          "actor": {
+            "type": "string",
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Actor"
+          },
+          "comment": {
+            "type": "string",
+            "maxLength": 2000,
+            "title": "Comment",
+            "default": ""
+          }
+        },
+        "type": "object",
+        "required": [
+          "actor"
+        ],
+        "title": "ApprovalDecision",
+        "description": "Approvals are always attributed to a named human (or system) actor."
+      },
+      "ApprovalStatus": {
+        "type": "string",
+        "enum": [
+          "pending",
+          "approved",
+          "rejected"
+        ],
+        "title": "ApprovalStatus"
+      },
+      "ArtifactView": {
+        "properties": {
+          "name": {
+            "type": "string",
+            "title": "Name"
+          },
+          "version": {
+            "type": "integer",
+            "title": "Version"
+          },
+          "sha256": {
+            "type": "string",
+            "title": "Sha256"
+          },
+          "produced_by": {
+            "type": "string",
+            "title": "Produced By"
+          },
+          "produced_at": {
+            "type": "number",
+            "title": "Produced At"
+          },
+          "content": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Content",
+            "description": "Only with ?include_content=true"
+          }
+        },
+        "type": "object",
+        "required": [
+          "name",
+          "version",
+          "sha256",
+          "produced_by",
+          "produced_at"
+        ],
+        "title": "ArtifactView"
+      },
+      "Autonomy": {
+        "type": "string",
+        "enum": [
+          "full",
+          "supervised",
+          "human_gated"
+        ],
+        "title": "Autonomy"
+      },
+      "CreateRunRequest": {
+        "properties": {
+          "scenario": {
+            "type": "string",
+            "title": "Scenario",
+            "description": "Name of a scenario from GET /scenarios"
+          },
+          "requirement": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Requirement",
+            "description": "Overrides the scenario's requirement"
+          },
+          "params": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Params",
+            "description": "Merged over the scenario's default params"
+          }
+        },
+        "type": "object",
+        "required": [
+          "scenario"
+        ],
+        "title": "CreateRunRequest"
+      },
+      "DagEdge": {
+        "properties": {
+          "source": {
+            "type": "string",
+            "title": "Source"
+          },
+          "target": {
+            "type": "string",
+            "title": "Target"
+          }
+        },
+        "type": "object",
+        "required": [
+          "source",
+          "target"
+        ],
+        "title": "DagEdge"
+      },
+      "DagNode": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "title": {
+            "type": "string",
+            "title": "Title"
+          },
+          "agent": {
+            "type": "string",
+            "title": "Agent"
+          },
+          "state": {
+            "$ref": "#/components/schemas/StageState"
+          },
+          "requires_approval": {
+            "type": "boolean",
+            "title": "Requires Approval"
+          },
+          "approval_kind": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Approval Kind"
+          },
+          "join": {
+            "type": "string",
+            "title": "Join"
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "title",
+          "agent",
+          "state",
+          "requires_approval",
+          "approval_kind",
+          "join"
+        ],
+        "title": "DagNode"
+      },
+      "DagView": {
+        "properties": {
+          "run_id": {
+            "type": "string",
+            "title": "Run Id"
+          },
+          "state": {
+            "$ref": "#/components/schemas/RunState"
+          },
+          "nodes": {
+            "items": {
+              "$ref": "#/components/schemas/DagNode"
+            },
+            "type": "array",
+            "title": "Nodes"
+          },
+          "edges": {
+            "items": {
+              "$ref": "#/components/schemas/DagEdge"
+            },
+            "type": "array",
+            "title": "Edges"
+          }
+        },
+        "type": "object",
+        "required": [
+          "run_id",
+          "state",
+          "nodes",
+          "edges"
+        ],
+        "title": "DagView"
+      },
+      "DecisionRecord": {
+        "properties": {
+          "ts": {
+            "type": "number",
+            "title": "Ts"
+          },
+          "run_id": {
+            "type": "string",
+            "title": "Run Id"
+          },
+          "stage_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Stage Id"
+          },
+          "kind": {
+            "type": "string",
+            "title": "Kind"
+          },
+          "rationale": {
+            "type": "string",
+            "title": "Rationale"
+          },
+          "outcome": {
+            "type": "string",
+            "title": "Outcome"
+          },
+          "inputs": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Inputs"
+          }
+        },
+        "type": "object",
+        "required": [
+          "run_id",
+          "kind",
+          "rationale",
+          "outcome"
+        ],
+        "title": "DecisionRecord",
+        "description": "One line of decision lineage: what was decided, by what, and why."
+      },
+      "ErrorBody": {
+        "properties": {
+          "code": {
+            "type": "string",
+            "title": "Code"
+          },
+          "message": {
+            "type": "string",
+            "title": "Message"
+          }
+        },
+        "type": "object",
+        "required": [
+          "code",
+          "message"
+        ],
+        "title": "ErrorBody"
+      },
+      "ErrorResponse": {
+        "properties": {
+          "error": {
+            "$ref": "#/components/schemas/ErrorBody"
+          }
+        },
+        "type": "object",
+        "required": [
+          "error"
+        ],
+        "title": "ErrorResponse"
+      },
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "type": "array",
+            "title": "Detail"
+          }
+        },
+        "type": "object",
+        "title": "HTTPValidationError"
+      },
+      "HealthResponse": {
+        "properties": {
+          "status": {
+            "type": "string",
+            "title": "Status",
+            "default": "ok"
+          }
+        },
+        "type": "object",
+        "title": "HealthResponse"
+      },
+      "RunAccepted": {
+        "properties": {
+          "run_id": {
+            "type": "string",
+            "title": "Run Id"
+          },
+          "state": {
+            "$ref": "#/components/schemas/RunState"
+          },
+          "links": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object",
+            "title": "Links"
+          }
+        },
+        "type": "object",
+        "required": [
+          "run_id",
+          "state",
+          "links"
+        ],
+        "title": "RunAccepted"
+      },
+      "RunMetrics": {
+        "properties": {
+          "started_at": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Started At"
+          },
+          "ended_at": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ended At"
+          },
+          "e2e_latency_ms": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "E2E Latency Ms"
+          },
+          "stages_succeeded": {
+            "type": "integer",
+            "title": "Stages Succeeded",
+            "default": 0
+          },
+          "stages_failed": {
+            "type": "integer",
+            "title": "Stages Failed",
+            "default": 0
+          },
+          "retries": {
+            "type": "integer",
+            "title": "Retries",
+            "default": 0
+          },
+          "fallbacks": {
+            "type": "integer",
+            "title": "Fallbacks",
+            "default": 0
+          },
+          "rollbacks": {
+            "type": "integer",
+            "title": "Rollbacks",
+            "default": 0
+          },
+          "approvals_requested": {
+            "type": "integer",
+            "title": "Approvals Requested",
+            "default": 0
+          },
+          "replans": {
+            "type": "integer",
+            "title": "Replans",
+            "default": 0
+          }
+        },
+        "type": "object",
+        "title": "RunMetrics"
+      },
+      "RunState": {
+        "type": "string",
+        "enum": [
+          "pending",
+          "running",
+          "waiting_approval",
+          "succeeded",
+          "failed",
+          "stopped",
+          "rolled_back"
+        ],
+        "title": "RunState"
+      },
+      "RunSummary": {
+        "properties": {
+          "run_id": {
+            "type": "string",
+            "title": "Run Id"
+          },
+          "scenario": {
+            "type": "string",
+            "title": "Scenario"
+          },
+          "state": {
+            "$ref": "#/components/schemas/RunState"
+          },
+          "created_at": {
+            "type": "number",
+            "title": "Created At"
+          },
+          "links": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object",
+            "title": "Links"
+          }
+        },
+        "type": "object",
+        "required": [
+          "run_id",
+          "scenario",
+          "state",
+          "created_at",
+          "links"
+        ],
+        "title": "RunSummary"
+      },
+      "RunView": {
+        "properties": {
+          "run_id": {
+            "type": "string",
+            "title": "Run Id"
+          },
+          "scenario": {
+            "type": "string",
+            "title": "Scenario"
+          },
+          "requirement": {
+            "type": "string",
+            "title": "Requirement"
+          },
+          "state": {
+            "$ref": "#/components/schemas/RunState"
+          },
+          "stop_requested": {
+            "type": "boolean",
+            "title": "Stop Requested"
+          },
+          "created_at": {
+            "type": "number",
+            "title": "Created At"
+          },
+          "params": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Params"
+          },
+          "stages": {
+            "items": {
+              "$ref": "#/components/schemas/StageView"
+            },
+            "type": "array",
+            "title": "Stages"
+          },
+          "artifacts": {
+            "items": {
+              "$ref": "#/components/schemas/ArtifactView"
+            },
+            "type": "array",
+            "title": "Artifacts"
+          },
+          "pending_approvals": {
+            "items": {
+              "$ref": "#/components/schemas/Approval"
+            },
+            "type": "array",
+            "title": "Pending Approvals"
+          },
+          "approvals": {
+            "items": {
+              "$ref": "#/components/schemas/Approval"
+            },
+            "type": "array",
+            "title": "Approvals"
+          },
+          "metrics": {
+            "$ref": "#/components/schemas/RunMetrics"
+          },
+          "links": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object",
+            "title": "Links"
+          }
+        },
+        "type": "object",
+        "required": [
+          "run_id",
+          "scenario",
+          "requirement",
+          "state",
+          "stop_requested",
+          "created_at",
+          "params",
+          "stages",
+          "artifacts",
+          "pending_approvals",
+          "approvals",
+          "metrics",
+          "links"
+        ],
+        "title": "RunView"
+      },
+      "ScenarioView": {
+        "properties": {
+          "name": {
+            "type": "string",
+            "title": "Name"
+          },
+          "title": {
+            "type": "string",
+            "title": "Title"
+          },
+          "description": {
+            "type": "string",
+            "title": "Description"
+          },
+          "requirement": {
+            "type": "string",
+            "title": "Requirement"
+          },
+          "params": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Params"
+          },
+          "stages": {
+            "items": {
+              "$ref": "#/components/schemas/StageSpec"
+            },
+            "type": "array",
+            "title": "Stages"
+          }
+        },
+        "type": "object",
+        "required": [
+          "name",
+          "title",
+          "description",
+          "requirement",
+          "params",
+          "stages"
+        ],
+        "title": "ScenarioView"
+      },
+      "StageSpec": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "title": {
+            "type": "string",
+            "title": "Title"
+          },
+          "agent": {
+            "type": "string",
+            "title": "Agent"
+          },
+          "depends_on": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Depends On"
+          },
+          "join": {
+            "type": "string",
+            "title": "Join",
+            "default": "all"
+          },
+          "entry_gates": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Entry Gates"
+          },
+          "exit_gates": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Exit Gates"
+          },
+          "max_attempts": {
+            "type": "integer",
+            "title": "Max Attempts",
+            "default": 2
+          },
+          "backoff_ms": {
+            "type": "integer",
+            "title": "Backoff Ms",
+            "default": 50
+          },
+          "fallback_agent": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Fallback Agent"
+          },
+          "rollback_agent": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Rollback Agent"
+          },
+          "requires_approval": {
+            "type": "boolean",
+            "title": "Requires Approval",
+            "default": false
+          },
+          "approval_kind": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Approval Kind"
+          },
+          "autonomy": {
+            "$ref": "#/components/schemas/Autonomy",
+            "default": "supervised"
+          },
+          "parallel_group": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Parallel Group"
+          },
+          "consumes": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Consumes"
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "title",
+          "agent"
+        ],
+        "title": "StageSpec",
+        "description": "Static, declarative description of one node of the workflow graph."
+      },
+      "StageState": {
+        "type": "string",
+        "enum": [
+          "pending",
+          "ready",
+          "running",
+          "waiting_approval",
+          "succeeded",
+          "failed",
+          "rolled_back",
+          "skipped",
+          "blocked"
+        ],
+        "title": "StageState"
+      },
+      "StageView": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "title": {
+            "type": "string",
+            "title": "Title"
+          },
+          "agent": {
+            "type": "string",
+            "title": "Agent"
+          },
+          "depends_on": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Depends On"
+          },
+          "state": {
+            "$ref": "#/components/schemas/StageState"
+          },
+          "attempts": {
+            "type": "integer",
+            "title": "Attempts"
+          },
+          "runs": {
+            "type": "integer",
+            "title": "Runs"
+          },
+          "used_fallback": {
+            "type": "boolean",
+            "title": "Used Fallback"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error"
+          },
+          "requires_approval": {
+            "type": "boolean",
+            "title": "Requires Approval"
+          },
+          "approval_kind": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Approval Kind"
+          },
+          "started_at": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Started At"
+          },
+          "ended_at": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ended At"
+          },
+          "duration_ms": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Duration Ms"
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "title",
+          "agent",
+          "depends_on",
+          "state",
+          "attempts",
+          "runs",
+          "used_fallback",
+          "error",
+          "requires_approval",
+          "approval_kind",
+          "started_at",
+          "ended_at",
+          "duration_ms"
+        ],
+        "title": "StageView"
+      },
+      "TraceView": {
+        "properties": {
+          "run_id": {
+            "type": "string",
+            "title": "Run Id"
+          },
+          "events": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "type": "array",
+            "title": "Events",
+            "description": "Telemetry audit events, in order"
+          },
+          "decisions": {
+            "items": {
+              "$ref": "#/components/schemas/DecisionRecord"
+            },
+            "type": "array",
+            "title": "Decisions",
+            "description": "Decision lineage kept on the run"
+          }
+        },
+        "type": "object",
+        "required": [
+          "run_id",
+          "events",
+          "decisions"
+        ],
+        "title": "TraceView"
+      },
+      "ValidationError": {
+        "properties": {
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "type": "array",
+            "title": "Location"
+          },
+          "msg": {
+            "type": "string",
+            "title": "Message"
+          },
+          "type": {
+            "type": "string",
+            "title": "Error Type"
+          },
+          "input": {
+            "title": "Input"
+          },
+          "ctx": {
+            "type": "object",
+            "title": "Context"
+          }
+        },
+        "type": "object",
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError"
+      }
+    }
+  }
+}

@@ -1,0 +1,129 @@
+"""Plain-text (ASCII) rendering of a run for the CLI. No I/O here: functions return strings."""
+from __future__ import annotations
+
+from typing import Any
+
+from orchestrator.models import ApprovalStatus, Run, StageRuntime
+
+
+def table(headers: list[str], rows: list[list[Any]]) -> str:
+    cells = [[str(c) for c in row] for row in rows]
+    widths = [max(len(h), *(len(r[i]) for r in cells)) for i, h in enumerate(headers)]
+    line = lambda row: "  ".join(c.ljust(w) for c, w in zip(row, widths)).rstrip()  # noqa: E731
+    return "\n".join([line(headers), line(["-" * w for w in widths]), *(line(r) for r in cells)])
+
+
+def duration_ms(st: StageRuntime) -> float | None:
+    if st.started_at is None or st.ended_at is None:
+        return None
+    return (st.ended_at - st.started_at) * 1000
+
+
+def gate_results(run: Run, stage_id: str) -> dict[str, dict[str, bool]]:
+    """phase -> {gate: passed}, keeping the latest evaluation of each gate."""
+    latest: dict[str, dict[str, bool]] = {"entry": {}, "exit": {}}
+    for d in run.decisions:
+        if d.kind == "gate" and d.stage_id == stage_id:
+            latest[d.inputs["phase"]][d.inputs["gate"]] = d.outcome == "pass"
+    return latest
+
+
+def _gate_cell(results: dict[str, dict[str, bool]]) -> str:
+    parts = [f"{phase} {sum(g.values())}/{len(g)}" for phase, g in results.items() if g]
+    return ", ".join(parts) or "-"
+
+
+def _approval_cell(run: Run, stage_id: str) -> str:
+    items = []
+    for a in run.approvals.values():
+        if a.stage_id == stage_id:
+            who = f" by {a.actor}" if a.actor else ""
+            items.append(f"{a.kind}: {a.status.value}{who}")
+    return "; ".join(items) or "-"
+
+
+def stage_rows(run: Run) -> list[list[Any]]:
+    rows = []
+    for stage_id, st in run.stages.items():
+        ms = duration_ms(st)
+        tries = f"{st.attempts}" + (" (fallback)" if st.used_fallback else "")
+        rows.append([stage_id, st.state.value, "-" if ms is None else f"{ms:.0f}", tries,
+                     _gate_cell(gate_results(run, stage_id)), _approval_cell(run, stage_id)])
+    return rows
+
+
+def pending_approvals(run: Run) -> list:
+    return [a for a in run.approvals.values() if a.status == ApprovalStatus.PENDING]
+
+
+def format_run(run: Run) -> str:
+    out = [f"Run {run.id}  scenario={run.scenario}  state={run.state.value.upper()}",
+           f'Requirement: "{run.requirement}"', "",
+           table(["STAGE", "STATE", "MS", "ATTEMPTS", "GATES (passed/total)", "APPROVAL"], stage_rows(run))]
+    failures = [f"  {s.spec.id}: {s.error}" for s in run.stages.values() if s.error]
+    if failures:
+        out += ["", "Errors:", *failures]
+    failed_gates = [f"  {d.stage_id} {d.inputs['phase']} {d.inputs['gate']}: {d.rationale}"
+                    for d in run.decisions if d.kind == "gate" and d.outcome == "fail"]
+    if failed_gates:
+        out += ["", "Failed gate evaluations:", *failed_gates]
+    out += ["", "Artifacts:", table(["NAME", "VER", "PRODUCED BY", "SHA256"],
+                                    [[a.name, a.version, a.produced_by, a.sha256] for a in run.artifacts.values()])]
+    out += ["", format_metrics(run)]
+    return "\n".join(out)
+
+
+def format_metrics(run: Run) -> str:
+    m = run.metrics
+    latency = "-" if m.e2e_latency_ms is None else f"{m.e2e_latency_ms:.0f} ms"
+    return ("Metrics: " + ", ".join([f"e2e={latency}", f"stages_ok={m.stages_succeeded}",
+                                     f"stages_failed={m.stages_failed}", f"retries={m.retries}",
+                                     f"fallbacks={m.fallbacks}", f"rollbacks={m.rollbacks}",
+                                     f"approvals={m.approvals_requested}", f"replans={m.replans}"]))
+
+
+def format_trace(run: Run) -> str:
+    rows = [[f"{(d.ts - run.created_at) * 1000:8.0f}", d.kind, d.stage_id or "-", d.outcome, d.rationale]
+            for d in run.decisions]
+    return table(["+MS", "KIND", "STAGE", "OUTCOME", "RATIONALE"], rows)
+
+
+def review_lines(run: Run, approval) -> list[str]:
+    """What the human is being asked to approve (the evidence behind the pause)."""
+    arts = {n: a.content for n, a in run.artifacts.items()}
+    if approval.kind == "requirement_interpretation":
+        return [f"  - {q['question']}\n      proposed: {q['proposed_resolution']}"
+                for q in arts.get("normalized_requirements", {}).get("open_questions", [])]
+    if approval.kind == "public_api_change":
+        return [f"  - [{c['feature']}] {c['change']}" for c in arts.get("impact", {}).get("public_api_changes", [])]
+    if approval.kind == "production_release":
+        rc = arts.get("test_report", {})
+        return [f"  - tests: {rc.get('passed', '?')} passed, {rc.get('failed', '?')} failed",
+                f"  - documentation: {len(arts.get('documentation', {}).get('files', []))} file(s)"]
+    return []
+
+
+def resume_hint(run: Run, db: str, default_db: str) -> str:
+    """Tell the human exactly how to continue a paused run."""
+    db_flag = "" if db == default_db else f" --db {db}"
+    lines = []
+    for a in pending_approvals(run):
+        lines += [f"PAUSED: run {run.id} is waiting for approval '{a.id}' ({a.kind}) at stage '{a.stage_id}'.",
+                  *review_lines(run, a),
+                  f"  approve: python -m scenarios resume {run.id} --approve {a.id} --actor you{db_flag}",
+                  f"  reject:  python -m scenarios resume {run.id} --reject {a.id} --actor you{db_flag}"]
+    return "\n".join(lines)
+
+
+def run_summary(run: Run) -> dict[str, Any]:
+    """JSON-friendly view for ``--json``."""
+    return {
+        "run_id": run.id, "scenario": run.scenario, "state": run.state.value,
+        "stages": [{"id": i, "state": s.state.value, "attempts": s.attempts, "used_fallback": s.used_fallback,
+                    "duration_ms": duration_ms(s), "error": s.error} for i, s in run.stages.items()],
+        "approvals": [a.model_dump(mode="json") for a in run.approvals.values()],
+        "pending_approvals": [a.id for a in pending_approvals(run)],
+        "artifacts": {n: {"version": a.version, "sha256": a.sha256, "produced_by": a.produced_by}
+                      for n, a in run.artifacts.items()},
+        "metrics": run.metrics.model_dump(),
+    }
