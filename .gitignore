@@ -14,3 +14,6 @@ data/*.json
 docs/generated/
 data/*.jsonl
 data/*.db-*
+
+# personal study guide - not part of the submission
+PLAIN_ENGLISH_GUIDE.md
