@@ -154,6 +154,11 @@ class Engine:
             for agent in (spec.agent, spec.fallback_agent, spec.rollback_agent):
                 if agent is not None and agent not in self.agents:
                     raise ValueError(f"stage '{spec.id}' uses unregistered agent '{agent}'")
+        # The initial requirement gets the same bounds and policy scan as an amended one, BEFORE any agent (or
+        # model) can read it. A refusal creates no run, so there is no run to audit it on.
+        if not isinstance(requirement, str) or len(requirement.strip()) > MAX_REQUIREMENT_CHARS:
+            raise ValueError(f"requirement must be text of at most {MAX_REQUIREMENT_CHARS} characters")
+        self.policy.check_artifact("requirement", {"requirement": requirement})
         run = Run(
             id=f"run-{uuid.uuid4().hex[:8]}",
             scenario=scenario,
@@ -185,6 +190,23 @@ class Engine:
 
     async def reject(self, run_id: str, approval_id: str, actor: str, comment: str = "") -> Run:
         return await self._resolve(run_id, approval_id, self._human(actor), comment, ApprovalStatus.REJECTED)
+
+    def check_comment(self, run_id: str, comment: str, actor: str) -> None:
+        """Bounds and policy-scans a human's comment before it is stored (approval, decision, audit trail).
+        Raises ValueError / PolicyViolation (an audited refusal on the run); the API calls it before going to the
+        background, so a bad comment is a clean 4xx."""
+        self._check_comment(self._live.get(run_id) or self._require(run_id), comment, actor)
+
+    def _check_comment(self, run: Run, comment: str, actor: str) -> None:
+        if not isinstance(comment, str) or len(comment) > MAX_COMMENT_CHARS:
+            raise ValueError(f"comment must be text of at most {MAX_COMMENT_CHARS} characters")
+        try:
+            self.policy.check_artifact("comment", {"comment": comment})
+        except PolicyViolation as violation:
+            self._record(run, "policy", f"comment refused: {violation.message}", "fail", rule=violation.rule,
+                         actor=actor)
+            self._save(run)
+            raise
 
     def _human(self, actor: str) -> str:
         """Human decisions need a real name; the engine's machine actors are reserved."""
@@ -486,8 +508,11 @@ class Engine:
         approval = Approval(id=f"{spec.id}-{n}", run_id=run.id, stage_id=spec.id, kind=kind)
         run.approvals[approval.id] = approval
         run.metrics.approvals_requested += 1
+        # What the human is shown is exactly these artifact versions: the hashes make "what was approved"
+        # reconstructable from the audit trail alone.
+        evidence = {n: run.artifacts[n].sha256 for n in spec.consumes if n in run.artifacts}
         self._record(run, "approval", f"approval '{approval.kind}' requested for stage '{spec.id}'", "requested",
-                     spec.id, approval_id=approval.id, approval_kind=approval.kind)
+                     spec.id, approval_id=approval.id, approval_kind=approval.kind, evidence_hashes=evidence)
         if self.auto_approve is not None and self.auto_approve.allows(kind):
             # Still a full audit trail: a real Approval + decision, just with a machine actor.
             actor = self.auto_approve.actor
@@ -502,6 +527,7 @@ class Engine:
     async def _resolve(self, run_id: str, approval_id: str, actor: str, comment: str,
                        status: ApprovalStatus) -> Run:
         live = self._live.get(run_id)
+        self.check_comment(run_id, comment, actor)
         if live is not None:  # other branches are still executing: just record and wake the loop
             self._apply_resolution(live, approval_id, actor, comment, status)
             self._wake[run_id].set()
@@ -671,8 +697,6 @@ class Engine:
         text = requirement.strip()
         if len(text) > MAX_REQUIREMENT_CHARS:
             raise ValueError(f"requirement is {len(text)} characters; the limit is {MAX_REQUIREMENT_CHARS}")
-        if not isinstance(comment, str) or len(comment) > MAX_COMMENT_CHARS:
-            raise ValueError(f"comment must be text of at most {MAX_COMMENT_CHARS} characters")
         if " ".join(text.split()) == " ".join(run.requirement.split()):
             raise ValueError("the new requirement is identical to the current one; nothing to re-plan")
         try:
@@ -683,15 +707,17 @@ class Engine:
                          rule=violation.rule, actor=actor)
             self._save(run)
             raise
+        self._check_comment(run, comment, actor)  # length + policy scan: the comment lands in the audit trail too
         return actor, text
 
     def _apply_amendment(self, run: Run, text: str, actor: str, comment: str) -> None:
+        old_text = run.requirement[:MAX_REQUIREMENT_CHARS]  # the old text stays in the audit trail (bounded)
         old_fp, new_fp = fingerprint(run.requirement), fingerprint(text)
         run.requirement = text
         run.metrics.replans += 1
         roots = [i for i, s in run.stages.items() if not s.spec.depends_on]
         specs = [s.spec for s in run.stages.values()]
-        affected = set(roots)
+        affected = set(roots) | {i for i, s in run.stages.items() if s.spec.reads_requirement}
         for root in roots:
             affected |= downstream(specs, root)
         reason = f"requirement amended by {actor}"
@@ -699,23 +725,27 @@ class Engine:
         requeued = [  # graph order. SUCCEEDED non-roots are kept until the hash comparison proves their input changed
             i for i, st in run.stages.items()
             if i in affected and st.state not in (StageState.PENDING, StageState.RUNNING)
-            and (st.state != StageState.SUCCEEDED or i in roots)
+            and (st.state != StageState.SUCCEEDED or i in roots or st.spec.reads_requirement)
         ]
         cancelled = [a.id for a in run.approvals.values() if a.stage_id in requeued and a.status == ApprovalStatus.PENDING]
         self._record(run, "replan",
                      reason + (f": {comment}" if comment else "") + f". Re-queued {requeued or 'nothing'}"
                      + (f"; {busy} is running and will be re-checked when it finishes" if busy else "")
                      + "; downstream stages re-run only if the artifacts they consume change",
-                     "requirement_amended", actor=actor, comment=comment, old_requirement_sha256=old_fp,
+                     "requirement_amended", actor=actor, comment=comment, old_requirement=old_text,
+                     new_requirement=text, old_requirement_sha256=old_fp,
                      new_requirement_sha256=new_fp, requeued=requeued, running_roots=busy,
                      cancelled_approvals=cancelled)
         for stage_id in requeued:
             self._reset_stage(run, run.stages[stage_id], reason)
 
     def _requeue_if_requirement_changed(self, run: Run, st: StageRuntime) -> bool:
-        """A root stage just succeeded. If the requirement was amended while it ran, its output describes the old
-        text: run it again. (Non-root stages read the requirement through artifacts, which the hash check covers.)"""
-        if run.stop_requested or st.spec.depends_on or st.requirement_fp == fingerprint(run.requirement):
+        """A stage that reads the requirement text just succeeded (a root stage, or one declared
+        ``reads_requirement``, e.g. documentation writes it into the changelog). If the requirement was amended
+        while it ran, its output describes the old text: run it again. Other stages see the requirement only
+        through artifacts, which the hash comparison covers."""
+        reads_text = not st.spec.depends_on or st.spec.reads_requirement
+        if run.stop_requested or not reads_text or st.requirement_fp == fingerprint(run.requirement):
             return False
         self._record(run, "replan", "requirement was amended while the stage ran; running it again on the new text",
                      "requeued", st.spec.id)

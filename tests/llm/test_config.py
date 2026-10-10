@@ -86,6 +86,13 @@ def test_resolve_llm_explicit_param_wins_otherwise_settings(monkeypatch):
     assert resolve_llm({}) is True and resolve_llm({"llm": False}) is False
 
 
+@pytest.mark.parametrize("value", ["0", "false", "", "yes", 0, 1, [], {}])
+def test_resolve_llm_rejects_anything_but_a_real_bool(value):
+    """'0' / 'false' are truthy strings: they must not silently switch the LLM layer on."""
+    with pytest.raises(ValueError, match="params.llm must be true or false"):
+        resolve_llm({"llm": value})
+
+
 @pytest.mark.parametrize("name", sorted(SCENARIOS))
 def test_default_scenario_is_exactly_the_offline_graph(name):
     offline = SCENARIOS[name]()

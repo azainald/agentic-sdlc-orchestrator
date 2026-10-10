@@ -19,7 +19,8 @@ def build() -> Scenario:
         StageSpec(id="requirements", title="Structure the requirement", agent="requirements",
                   exit_gates=["requirements_complete"]),
         StageSpec(id="normalize", title="Propose bounded interpretations", agent="normalize",
-                  depends_on=["requirements"], entry_gates=["requirements_complete"], consumes=["requirements"]),
+                  depends_on=["requirements"], entry_gates=["requirements_complete"], consumes=["requirements"],
+                  reads_requirement=True),  # the LLM variant of this agent quotes the requirement in its prompt
         # The human reviews normalized_requirements (the proposals); approval lets this stage apply them.
         StageSpec(id="apply_interpretation", title="Apply the approved interpretation", agent="apply_interpretation",
                   depends_on=["normalize"], exit_gates=["ambiguity_resolved"],

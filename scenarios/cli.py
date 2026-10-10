@@ -27,7 +27,7 @@ from orchestrator.store import SqliteRunStore
 from orchestrator.telemetry import Telemetry, replay_runs
 
 from .registry import SCENARIOS, get_scenario
-from .report import format_metrics, format_run, format_trace, pending_approvals, resume_hint, run_summary, table
+from .report import format_metrics, format_run, format_trace, pending_approvals, resume_hint, run_summary, safe, table
 
 DEFAULT_DB = "data/runs.db"
 DEFAULT_AUDIT = "data/audit.jsonl"
@@ -187,7 +187,7 @@ def format_amendment(run: Run, old_requirement: str, actor: str, rows: list[list
            "", "Re-plan lineage (decisions written by this command):"]
     out += [f"  {d.kind:<8} {d.stage_id or '-':<18} {d.outcome:<20} {d.rationale}" for d in lineage]
     out += ["", format_metrics(run)]
-    return "\n".join(out)
+    return safe("\n".join(out))
 
 
 def cmd_status(args: argparse.Namespace) -> int:
@@ -238,9 +238,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     try:
         return handler(args)
     except (KeyError, ValueError) as exc:  # unknown run, unknown / already resolved approval, bad amendment
-        print(f"error: {exc.args[0] if isinstance(exc, KeyError) else exc}", file=sys.stderr)
+        print(safe(f"error: {exc.args[0] if isinstance(exc, KeyError) else exc}"), file=sys.stderr)
         return 2
-    except PolicyViolation as violation:  # an amended requirement that contains a secret / unsafe URL
-        print(f"error: policy violation: {violation.message} (rule {violation.rule}); the run was not changed",
-              file=sys.stderr)
+    except PolicyViolation as violation:  # a requirement or comment that contains a secret / unsafe URL
+        print(safe(f"error: policy violation: {violation.message} (rule {violation.rule}); refused, nothing was "
+                   "created or changed"), file=sys.stderr)
         return 2

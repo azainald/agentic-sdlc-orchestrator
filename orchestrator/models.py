@@ -111,6 +111,9 @@ class StageSpec(BaseModel):
     autonomy: Autonomy = Autonomy.SUPERVISED
     parallel_group: Optional[str] = None        # informational label
     consumes: list[str] = Field(default_factory=list)  # artifact names read (drives re-plan)
+    # True if the agent also reads the raw requirement text (not only artifacts): an amendment then re-runs the
+    # stage even when every artifact it consumes is unchanged. Root stages always read it.
+    reads_requirement: bool = False
     # Per-attempt wall-clock limit. A Python thread cannot be force-killed, so on timeout the attempt is
     # abandoned (counts as failed) but the worker thread may linger until the agent returns.
     timeout_ms: Optional[int] = Field(default=None, gt=0)

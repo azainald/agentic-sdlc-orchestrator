@@ -104,7 +104,8 @@ async def test_amend_at_the_release_gate_reruns_only_what_the_new_requirement_to
     [amended] = decisions(run, "replan", "requirement_amended")
     assert amended.inputs["actor"] == "alice" and amended.inputs["cancelled_approvals"] == ["release-1"]
     applied = [(d.stage_id, d.inputs["reset"]) for d in decisions(run, "replan", "applied")]
-    assert applied[0][0] == "requirements" and "impact" in applied[0][1] and "documentation" in applied[0][1]
+    assert applied[0][0] == "requirements" and "impact" in applied[0][1]
+    assert "documentation" in amended.inputs["requeued"]  # it quotes the requirement text: re-run by the amendment itself
     assert not any("testing" in reset for _, reset in applied)
     assert run.metrics.replans == 1 + len(applied)
 

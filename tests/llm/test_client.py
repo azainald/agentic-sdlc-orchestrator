@@ -5,7 +5,7 @@ import httpx
 import pytest
 from pydantic import BaseModel
 
-from orchestrator.llm import LLMInvalidOutput, LLMRateLimited, LLMUnavailable, ScriptedLLM, build_client
+from orchestrator.llm import LLMAuthError, LLMInvalidOutput, LLMRateLimited, LLMUnavailable, ScriptedLLM, build_client
 from orchestrator.llm.client import parse_model_json, strip_fences
 from orchestrator.llm.config import LLMSettings
 from orchestrator.llm.gemini import GeminiClient
@@ -220,3 +220,74 @@ def test_gemini_requires_a_key():
 def test_build_client_without_configuration_is_llm_unavailable():
     with pytest.raises(LLMUnavailable, match="not configured"):
         build_client(LLMSettings(provider="none"))
+
+
+# ------------------------------------------------- a refused key is permanent
+class Counting:
+    """An httpx handler that counts requests and always answers with ``response``."""
+
+    def __init__(self, response):
+        self.response, self.calls = response, 0
+
+    def __call__(self, request):
+        self.calls += 1
+        return self.response
+
+
+REFUSALS = [httpx.Response(400, json={"error": {"message": "API key not valid. Please pass a valid API key."}}),
+            httpx.Response(401, json={"error": {"message": "unauthenticated"}}),
+            httpx.Response(403, json={"error": {"message": "permission denied"}})]
+
+
+@pytest.mark.parametrize("refusal", REFUSALS, ids=["400-key-not-valid", "401", "403"])
+def test_a_refused_key_stops_at_the_first_model_and_opens_the_circuit(refusal):
+    handler = Counting(refusal)
+    c = client(handler)                                  # three models configured
+    with pytest.raises(LLMAuthError):
+        ask(c)
+    assert handler.calls == 1                            # the other two models were not tried
+    for _ in range(5):                                   # circuit open: no network request at all
+        with pytest.raises(LLMUnavailable, match="refused earlier"):
+            ask(c)
+    assert handler.calls == 1
+
+
+def test_a_refused_key_error_never_contains_the_key_and_the_circuit_message_does_not_grow():
+    key_echo = httpx.Response(400, json={"error": {"message": f"API key not valid: {KEY}"}})
+    c = client(Counting(key_echo))
+    messages = []
+    for _ in range(3):
+        with pytest.raises(LLMAuthError) as err:
+            ask(c)
+        messages.append(str(err.value))
+    assert all(KEY not in m for m in messages) and "<redacted>" in messages[0]
+    assert messages[1] == messages[2] and messages[1].count("refused earlier") == 1
+
+
+def test_other_client_errors_are_not_treated_as_a_refused_key():
+    handler = Counting(httpx.Response(400, json={"error": {"message": "Invalid JSON payload"}}))
+    c = client(handler)
+    for _ in range(2):
+        with pytest.raises(LLMUnavailable) as err:
+            ask(c)
+        assert not isinstance(err.value, LLMAuthError)
+    assert handler.calls == 6                            # 3 models x 2 calls: no circuit, the next model is tried
+
+
+def test_a_transient_failure_does_not_open_the_circuit():
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        return httpx.Response(404) if len(calls) == 1 else answer('{"name": "a", "n": 1}')
+
+    c = client(handler)
+    assert ask(c).name == "a" and len(calls) == 2        # m1 missing -> m2 answered
+    assert ask(c).name == "a"                            # still usable afterwards
+
+
+def test_each_client_has_its_own_circuit():
+    refused, healthy = client(Counting(REFUSALS[1])), client(lambda request: answer('{"name": "a", "n": 1}'))
+    with pytest.raises(LLMAuthError):
+        ask(refused)
+    assert ask(healthy).n == 1

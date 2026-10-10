@@ -8,10 +8,10 @@ from typing import Optional
 
 from .client import LLMClient
 from .config import LLMSettings, get_settings
-from .errors import LLMError, LLMInvalidOutput, LLMRateLimited, LLMUnavailable
+from .errors import LLMAuthError, LLMError, LLMInvalidOutput, LLMRateLimited, LLMUnavailable
 from .fake import ScriptedLLM
 
-__all__ = ["LLMClient", "LLMError", "LLMInvalidOutput", "LLMRateLimited", "LLMSettings", "LLMUnavailable",
+__all__ = ["LLMAuthError", "LLMClient", "LLMError", "LLMInvalidOutput", "LLMRateLimited", "LLMSettings", "LLMUnavailable",
            "ScriptedLLM", "build_client", "get_settings"]
 
 

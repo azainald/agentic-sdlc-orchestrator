@@ -72,6 +72,13 @@ def _open_questions(text: str, features: list[str]) -> list[str]:
     return ["behaviour", "success"]
 
 
+def is_explicitly_vague(text: str) -> bool:
+    """The deterministic verdict that a request is ambiguous: it names a quality ('safer', 'robust', 'improve') and
+    no concrete feature. Used to cross-check a model, which may not claim such a request is clear. (A text with no
+    vague word and no keyword, e.g. a paraphrase, is NOT covered: recognising those is what the model is for.)"""
+    return not detect_features(text) and bool(vague_terms(text))
+
+
 def requirements_agent(ctx: AgentContext) -> AgentResult:
     text = ctx.requirement.strip()
     features = detect_features(text)

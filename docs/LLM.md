@@ -231,6 +231,8 @@ approvals auto-granted by the engine's demo policy, actor `auto-approver`).
   manipulated model can still produce a misleading but harmless-looking requirement; a human reviews the approval stages.
 * **One provider, tested live only on Gemini**, only the lite models, small inputs. Latency numbers are single
   samples from one network.
-* **Cost/privacy.** The requirement text and the product facts are sent to Google. Do not enable this for requirements
-  that must not leave the machine.
+* **Cost/privacy.** The requirement text and the product facts are sent to Google. Requirements are policy-scanned
+  (secrets, unsafe URLs) when the run is created, before any model call, and a requirement that fails the scan is
+  refused; text that passes the scan IS sent to Google. Do not enable this for requirements that must not leave the
+  machine.
 * **Model names change.** The defaults reflect what worked for a new free-tier key at the time of writing.

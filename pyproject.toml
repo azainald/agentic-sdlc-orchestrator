@@ -13,4 +13,4 @@ dynamic = ["dependencies"]
 dependencies = { file = ["requirements.txt"] }
 
 [tool.setuptools.packages.find]
-include = ["orchestrator*", "shortener*", "scenarios*"]
+include = ["orchestrator*", "shortener*", "scenarios*", "evals*"]

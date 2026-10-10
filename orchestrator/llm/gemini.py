@@ -3,6 +3,8 @@
 The API key travels ONLY in the ``x-goog-api-key`` header, never in the URL, and is scrubbed from every
 error message. 429 and 5xx get a small bounded retry that honours ``Retry-After``; a model that does not
 exist for this key (404) or stays rate limited hands over to the next model in the list.
+A refused key (401, 403, 400 "API key not valid") is permanent: no other model is tried, and the client then
+fails every later call immediately, without a network request (a small circuit breaker).
 """
 from __future__ import annotations
 
@@ -14,7 +16,7 @@ import httpx
 
 from .client import T, parse_model_json
 from .config import DEFAULT_MODEL, FALLBACK_MODELS
-from .errors import LLMInvalidOutput, LLMRateLimited, LLMUnavailable
+from .errors import LLMAuthError, LLMInvalidOutput, LLMRateLimited, LLMUnavailable
 
 BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models"
 MAX_RETRIES = 2                 # per model, on 429 / 5xx
@@ -33,6 +35,7 @@ class GeminiClient:
         self.model = model                      # the model that answered last
         self._http = httpx.Client(timeout=timeout, transport=transport)
         self._sleep = sleep
+        self._auth_failure: Optional[str] = None  # set once the key is refused: the circuit is then open for good
 
     # ------------------------------------------------------------------ public
     def generate_json(self, system: str, prompt: str, schema: type[T], *, temperature: float = 0.2,
@@ -48,6 +51,8 @@ class GeminiClient:
                 "thinkingConfig": {"thinkingLevel": "minimal"},
             },
         }
+        if self._auth_failure:
+            raise LLMAuthError(self._auth_failure)
         deadline = time.monotonic() + DEADLINE_S
         last: Exception = LLMUnavailable("no model configured")
         for model in self.models:
@@ -55,6 +60,9 @@ class GeminiClient:
                 text = self._answer(model, body, deadline)
                 self.model = model
                 return parse_model_json(text, schema)
+            except LLMAuthError as exc:  # the key itself is refused: other models would be refused too
+                self._auth_failure = f"{exc} (the API key was refused earlier; not calling the API again)"
+                raise
             except LLMUnavailable as exc:  # missing model, rate limit, 5xx, block: the next model may still answer
                 last = exc
             if time.monotonic() > deadline:
@@ -79,7 +87,10 @@ class GeminiClient:
             if status == 404:
                 raise LLMUnavailable(f"{model}: model not found for this key")
             if status != 429 and status < 500:
-                raise LLMUnavailable(f"{model}: HTTP {status} {self._error_text(response)}")
+                detail = f"{model}: HTTP {status} {self._error_text(response)}"
+                if status in (401, 403) or (status == 400 and "api key not valid" in detail.lower()):
+                    raise LLMAuthError(detail)
+                raise LLMUnavailable(detail)
             too_long = retry_after is not None and retry_after > MAX_RETRY_AFTER_S
             if attempt == MAX_RETRIES or too_long or time.monotonic() > deadline:
                 detail = f"{model}: HTTP {status}" + (f", retry after {retry_after:.0f}s" if retry_after else "")

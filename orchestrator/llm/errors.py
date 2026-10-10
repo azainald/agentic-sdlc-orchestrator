@@ -11,6 +11,11 @@ class LLMUnavailable(LLMError):
     """No model could answer: not configured, network down, timeout, 4xx/5xx, blocked or truncated answer."""
 
 
+class LLMAuthError(LLMUnavailable):
+    """The provider refused the API key (HTTP 401/403, or 400 'API key not valid'). Permanent for this client: no
+    other model will accept the key, so nothing else is tried and later calls fail without a network request."""
+
+
 class LLMRateLimited(LLMUnavailable):
     """The provider answered 429 and the bounded internal retries did not help."""
 

@@ -1,6 +1,6 @@
 # Scenarios: what each one does, with real output
 
-Three scenarios run on the same engine and the same shortener product. Everything below was produced by running the commands shown on 2026-10-10 in this repository; excerpts are trimmed, never edited. Run ids and millisecond timings differ on every run. Background: [README.md](../README.md) for commands, [ARCHITECTURE.md](../ARCHITECTURE.md) for semantics.
+Three scenarios run on the same engine and the same shortener product. Everything below was produced by running the commands shown on 2026-10-10 in this repository; excerpts are trimmed, never edited. Run ids and millisecond timings differ on every run. Background: [README.md](../README.md) for commands, [ARCHITECTURE.md](../ARCHITECTURE.md) for semantics. Sections 5 and 6 cover the two later features: changing a requirement mid-run (`amend`, [REPLAN.md](REPLAN.md)) and the optional model-backed agents (`--llm`, [LLM.md](LLM.md)). Sections 1 to 4 are the default, deterministic runs and use no model.
 
 | | Greenfield | Brownfield | Ambiguous |
 |---|---|---|---|
@@ -55,7 +55,7 @@ non_goals: A web UI | Multi-tenant accounts or billing | Automatic deletion of e
 assumptions: ... | The maximum ttl is 31536000 seconds (365 days) | Visitor identity is approximated by a hashed client IP | ...
 ```
 
-This is a rule-based extraction (regex feature table), not model reasoning; see ARCHITECTURE.md section 13. Note what it did not detect: "REST API" and "redirect" are not features in the table, so no feature is generated for them; the `impl_api` and `impl_store` checks are part of the scenario graph regardless.
+This is a rule-based extraction (regex feature table), not model reasoning; see ARCHITECTURE.md section 13. (With `--llm` a model writes this artifact instead and falls back to this agent on any failure; see section 6.) Note what it did not detect: "REST API" and "redirect" are not features in the table, so no feature is generated for them; the `impl_api` and `impl_store` checks are part of the scenario graph regardless.
 
 ### Decomposition
 
@@ -530,7 +530,144 @@ mttr_ms 165.8     avg_e2e_latency_ms 3972.7   avg_active_ms 268.2   p95_e2e_late
 
 ---
 
-## 5. Paths proven by tests rather than by the CLI
+## 5. Changing the requirement mid-run: `amend`
+
+None of the three scenarios triggers a re-plan on its own: every artifact is published once, so the metrics lines above show `replans=0`. A re-plan is triggered when an upstream artifact changes after a stage already used it, and the way to cause that in a scenario is for a named person to amend the requirement of a run that is not finished. The full algorithm, the governance rules and the limits are in [REPLAN.md](REPLAN.md); this is the short version with real output.
+
+```text
+python -m scenarios amend <run_id> --requirement "..." --actor you [--comment "..."] [--db ...] [--audit ...] [--json]
+POST /runs/{id}/amend   {"requirement": "...", "actor": "alice", "comment": "optional"}
+```
+
+What happens: the engine validates first (a human actor, a run that is not finished or stopping, non-empty text of at most 2000 characters that differs from the current one, and the same secret and unsafe-URL scan as artifacts; a refusal leaves the run untouched, exits with code 2 and is audited without echoing the value). Then it records `replan / requirement_amended`, re-queues the root stage and every downstream stage that is not `succeeded`, withdraws the pending approvals on stages it re-queued (the approval table shows them as `withdrawn by engine`), and resumes the run. From there the normal hash comparison decides which of the stages that already succeeded must run again: a stage runs again only if an artifact it consumed changed, and a stage that re-runs and reproduces an identical artifact invalidates nothing after it (the cascade is lazy).
+
+Real run, copied from [REPLAN.md](REPLAN.md) (brownfield, `--skip-pytest`, amended while waiting at the release gate; paths shortened, long lines trimmed with `...`):
+
+```text
+$ python -m scenarios brownfield --skip-pytest --requirement "Extend the URL shortener: add custom aliases for links" --db demo.db --audit demo.jsonl
+  ... PAUSED at api_change_review-1
+$ python -m scenarios resume run-e5bf9e31 --approve api_change_review-1 --actor alice --db demo.db --audit demo.jsonl
+  ... PAUSED at release-1 (production_release)
+
+$ python -m scenarios amend run-e5bf9e31 --requirement "Extend the URL shortener: add custom aliases and expiring links" --actor alice --comment "product also wants expiry" --db demo.db --audit demo.jsonl
+Run run-e5bf9e31  scenario=brownfield  state=WAITING_APPROVAL
+Requirement amended by alice:
+  before: "Extend the URL shortener: add custom aliases for links"
+  after:  "Extend the URL shortener: add custom aliases and expiring links"
+
+Stages (RUNS = executions before -> now; RESULT = what this amendment did):
+STAGE              STATE             RUNS    RESULT
+-----------------  ----------------  ------  -----------------------------------
+requirements       succeeded         1 -> 2  re-ran
+impact             succeeded         1 -> 2  re-ran
+architecture       succeeded         1 -> 2  re-ran
+api_change_review  waiting_approval  1 -> 1  waiting for approval
+impl_alias         pending           1 -> 1  queued to re-run
+impl_ttl           pending           1 -> 1  queued to re-run
+impl_ratelimit     pending           1 -> 1  queued to re-run
+sync               succeeded         1 -> 1  kept so far (upstream not finished)
+testing            succeeded         1 -> 1  kept so far (upstream not finished)
+documentation      pending           1 -> 1  queued to re-run
+release            pending           0 -> 0  not run yet
+
+Re-plan lineage (decisions written by this command):
+  replan   -                  requirement_amended  requirement amended by alice: product also wants expiry. Re-queued ['requirements', 'release']; ...
+  approval release            cancelled            pending approval withdrawn: requirement amended by alice
+  replan   requirements       applied              'requirements' changed ['requirements']: 'impact' consumed outdated ['requirements']; 'architecture' ...
+  replan   impact             applied              'impact' changed ['impact']: 'api_change_review' consumed outdated ['impact']; 'impl_alias' ...
+  approval api_change_review  requested            approval 'public_api_change' requested for stage 'api_change_review'
+  approval -                  paused               run paused until pending approvals are resolved
+
+PAUSED: run run-e5bf9e31 is waiting for approval 'api_change_review-2' (public_api_change) at stage 'api_change_review'.
+  - [alias] POST /api/v1/urls accepts an optional 'alias'; adds 409 alias_taken, 422 invalid_alias and reserved_alias
+  - [ttl] POST and PATCH accept ttl_seconds; GET /{code} returns 410 expired after expiry
+```
+
+Read it like this. The release approval `release-1` was withdrawn, and the API-change approval that had just been granted is asked again as `api_change_review-2`: it was about an impact analysis that no longer exists, and the reviewer now sees the new `[ttl]` change. `sync` and `testing` are only "kept so far": the implementation checks behind the approval have not re-run yet, so it is not yet known whether their inputs change. After approving `api_change_review-2` and `release-2`, the final table (also in REPLAN.md) shows the selectivity:
+
+```text
+STAGE              STATE      MS   ATTEMPTS  RUNS  GATES (passed/total)  APPROVAL
+requirements       succeeded  1    1         2     exit 1/1              -
+...
+api_change_review  succeeded  0    1         2     entry 1/1             public_api_change: approved by alice; public_api_change: approved by bob
+sync               succeeded  26   1         2     exit 1/1              -
+testing            succeeded  109  1         1     entry 1/1, exit 1/1   -
+release            succeeded  16   1         1     entry 3/3             production_release: withdrawn by engine; production_release: approved by carol
+Metrics: e2e=7775 ms, stages_ok=11, stages_failed=0, retries=0, fallbacks=0, rollbacks=0, approvals=4, replans=4
+```
+
+`testing` has `RUNS = 1`: it consumes only the merged `implementation` artifact, which came out identical, so it was kept. Everything else genuinely depends on the requirement and ran twice. `replans=4` is the amendment itself plus three hash-triggered re-plan passes; one amendment never shows `replans=1`.
+
+Reproduced on 2026-10-10 with a different amendment ("... and show click analytics to link owners", amended while the run waited at `release-1`): `requirements`, `impact`, `architecture`, `api_change_review` and the three `impl_*` stages and `documentation` ran twice, `sync` and `testing` kept `RUNS = 1`, the new approval was `api_change_review-2` (with `[analytics]` added to the review block), and the run finished `SUCCEEDED` after `api_change_review-2` and `release-2`. Refusals, same day: amending a finished run prints `error: run 'run-957277a6' is already succeeded; start a new run instead`; a requirement containing `password=...` prints `error: policy violation: unquoted credential assignment found in artifact 'requirement' field 'requirement' (rule secret_detected); the run was not changed`; actor `engine` prints `error: actor 'engine' is reserved for the engine and cannot make human decisions`. All three exit with code 2.
+
+Two output details that apply to every command, not only `amend`:
+
+* `status <run_id>`, `resume` and `amend` show a **RUNS** column (executions of each stage) as soon as any stage has run more than once (`trace` prints decisions, not the stage table). For a run that was never re-planned the table has no such column, so ordinary output is unchanged.
+* The resume hint repeats a non-default `--db` and `--audit` in every command it prints, so copying it always reaches the same store, and it ends with an amend line:
+
+```text
+PAUSED: run run-957277a6 is waiting for approval 'api_change_review-1' (public_api_change) at stage 'api_change_review'.
+  ...
+  approve: python -m scenarios resume run-957277a6 --approve api_change_review-1 --actor you --db demo.db --audit demo.jsonl
+  reject:  python -m scenarios resume run-957277a6 --reject api_change_review-1 --actor you --db demo.db --audit demo.jsonl
+  amend the requirement instead: python -m scenarios amend run-957277a6 --requirement "..." --actor you --db demo.db --audit demo.jsonl
+```
+
+Limits worth repeating (all in REPLAN.md): an artifact is hashed as a whole, so a stage re-runs when any part of what it consumes changes; a stage that is running cannot be interrupted, so one amendment can cost one wasted execution; after about three amendments of one run the re-plan cap is reached and the run fails loudly (`stale_after_replan_limit`) instead of continuing on stale results; and the amender is a name the caller states, not an authenticated identity.
+
+---
+
+## 6. Optional: model-backed agents (`--llm`)
+
+Everything above ran deterministically: no network, no key, no model. The optional layer swaps four agents (`requirements`, `normalize`, `architecture`, `documentation`) for Gemini-backed twins and keeps the deterministic agent as the fallback. It does not change the graph, the gates, the policy checks or the approval stages: **LLM proposes; deterministic tools verify; gates and humans decide.** Design, safety model and real eval numbers: [LLM.md](LLM.md).
+
+How to switch it on:
+
+* CLI: `python -m scenarios <greenfield|brownfield|ambiguous> --llm ...`. It needs `GEMINI_API_KEY` (in the git-ignored `.env` or the environment). Setting `LLM_ENABLED=1` as well makes plain scenario commands use the model without the flag; `LLM_ENABLED=0` in the environment forces an offline run.
+* HTTP: `POST /runs` with `"params": {"llm": true}`. Without a configured key the answer is `422 llm_not_configured` (checked against a real server, no key set: `{"error":{"code":"llm_not_configured","message":"params.llm needs GEMINI_API_KEY (set it in .env)"}}`).
+* Offline evaluation: `python -m evals` scores the deterministic agents on 10 labelled texts; `python -m evals --llm --pause 4` adds the model.
+
+Real run with the flag but **no key** (2026-10-10), to show that a missing key degrades instead of failing. `GEMINI_API_KEY` was set to empty for this run, so nothing left the machine (on a machine that has a key in `.env`, `LLM_PROVIDER=none` in the environment forces the same "not configured" path; checked, same result):
+
+```text
+$ python -m scenarios greenfield --auto-approve --skip-pytest --llm
+*** DEMO MODE: all approvals auto-granted (no human review) ***
+Run run-2096238f  scenario=greenfield  state=SUCCEEDED
+LLM layer: ON. LLM proposes; deterministic tools verify; gates and humans decide.
+Generators: requirements=deterministic (fallback), architecture=deterministic (fallback), documentation=deterministic (fallback)
+
+STAGE           STATE      MS   ATTEMPTS      GATES (passed/total)  APPROVAL
+requirements    succeeded  72   3 (fallback)  exit 1/1              -
+architecture    succeeded  70   3 (fallback)  entry 2/2, exit 1/1   -
+impl_api        succeeded  206  1             entry 1/1             -
+...
+documentation   succeeded  97   3 (fallback)  entry 1/1, exit 1/1   -
+release         succeeded  12   1             entry 3/3             production_release: approved by demo-auto-approver
+
+Metrics: e2e=505 ms, stages_ok=9, stages_failed=0, retries=3, fallbacks=3, rollbacks=0, approvals=1, replans=0
+```
+
+and the decision lineage of the same run (`python -m scenarios trace <run_id>`, requirements stage; the other two LLM stages are identical):
+
+```text
+ 59  retry     requirements  failed     attempt 1/2 with 'requirements_llm' failed: LLM is not configured (set GEMINI_API_KEY in .env or the environment)
+ 59  retry     requirements  scheduled  retrying in 50 ms
+117  retry     requirements  failed     attempt 2/2 with 'requirements_llm' failed: LLM is not configured (set GEMINI_API_KEY in .env or the environment)
+118  fallback  requirements  attempted  retries exhausted; trying fallback agent 'requirements'
+```
+
+This is the engine's ordinary retry, then fallback ladder from section 4, applied to an LLM agent. The same path handles a 429 from the free tier, an outage, malformed JSON and an exit-gate failure. [LLM.md](LLM.md) shows the same thing against the real API with a deliberately invalid key (`HTTP 400 API key not valid` from Google, three retries and three fallbacks). What a model run looks like, in the numbers published in LLM.md (real run, `gemini-3.5-flash-lite`, 10 self-written cases; treat as a smoke test, not a benchmark):
+
+| Family | Mode | N | Gate | Precision | Recall | Vague/clear correct | Policy violations |
+|---|---|--:|--:|--:|--:|--:|--:|
+| requirements | deterministic | 10 | 90% | 65% | 65% | 70% | 1 |
+| requirements | llm | 10 | 100% | 100% | 100% | 100% | 0 |
+
+and one honest caveat from the same page: in the greenfield architecture the model labelled `GET /{code}` an "Add" API delta although that endpoint already exists. Fluent output is not verified output; the `impact` agent and the implementation checks, which stay deterministic, are what keep the pipeline tied to the real code, and the approval stages are never LLM stages. Both real full runs with a key (greenfield 3.8 s, ambiguous 4.2 s, 0 retries and 0 fallbacks) are reported in LLM.md; they were not re-run for this page.
+
+---
+
+## 7. Paths proven by tests rather than by the CLI
 
 Some behaviours cannot be triggered from the scenarios' command line. They are covered by the engine tests and, where useful, were run directly:
 
@@ -539,9 +676,10 @@ Some behaviours cannot be triggered from the scenarios' command line. They are c
 | Policy hard stop (secret in an artifact) | Ran an engine with an agent returning `{"db": {"password": "..."}}`, a stage `max_attempts=3` and a fallback agent: the stage is `failed` after 1 attempt, no retry, no fallback; decision `policy fail: literal secret value found in artifact 'config' field 'db.password'`, then `stop requested: policy violation triggered an automatic safe-stop`; the dependent stage is `skipped`; run `failed`. Test: `test_secret_in_artifact_is_a_hard_stop_with_no_retry`, `test_policy_violation_safe_stops_other_branches`. |
 | Stage-definition violations | `create_run` raises before a run exists; over HTTP: 422 `policy_violation`. Test: `test_create_run_rejects_policy_violating_stage`, `test_create_run_policy_violation_is_422`. |
 | Safe-stop with an in-flight stage | The in-flight stage finishes, later attempts, fallback and rollback do not launch, the run ends `stopped`. Tests: `test_stop_lets_inflight_stage_finish_and_skips_the_rest`, `test_stop_skips_remaining_retries_and_the_run_ends_stopped_not_failed`, `test_stop_does_not_launch_the_rollback_agent_and_the_stage_counts_as_failed`. |
-| Re-plan on a changed upstream artifact, and the cap | Tests in `tests/orchestrator/test_engine.py` (`test_replan_*`). No scenario triggers it; their metrics show `replans=0`. |
+| Re-plan on a changed upstream artifact, the lazy cascade and the cap | Tests in `tests/orchestrator/test_engine.py` (`test_replan_*`) and `tests/orchestrator/test_amend.py`. The default scenario runs do not trigger it (`replans=0`); `amend` does, end to end in `tests/scenarios/test_amend.py` and by hand in section 5. |
+| A model cannot approve, route or smuggle fields; a prompt-injected secret is a hard stop | `tests/llm/test_scenarios_llm.py` (scripted fake model, no network): `test_a_model_cannot_approve_anything_or_alter_routing`, `test_prompt_injection_that_obeys_the_attacker_hits_the_policy_hard_stop`, `test_llm_stages_are_never_the_approval_stages`; `tests/llm/test_agents.py::test_unknown_keys_are_dropped_so_a_model_cannot_add_fields`. |
 | Timeout of an attempt | `test_agent_timeout_fails_the_attempt_and_counts_toward_retries`. The `testing` stage carries a 120 s timeout in every scenario (`test_scenario_testing_stages_have_a_timeout`). |
 | Clients cannot enable demo mode | Real server: `POST /runs` with `params.auto_approve` answers 422 `auto_approve_not_allowed`; `{"actor":"system"}` answers 422 `invalid_actor`. Tests: `test_client_cannot_enable_auto_approve_through_run_params`, `test_reserved_actor_names_cannot_approve_or_reject_over_http`. |
 | A run survives an orchestrator restart | Real server: created a brownfield run over HTTP, approved the first checkpoint, killed the server process, restarted it; `GET /runs/{id}` still showed `waiting_approval` with `release-1` pending, and approving it finished the run `succeeded`. Test: `test_run_survives_restart_via_shared_store`. |
 
-One observation from that restart: after the restart, `GET /metrics` showed `runs_started: 0` with `runs_succeeded: 1`, and the telemetry half of `/runs/{id}/trace` held only the new process's 9 events while the `decisions` list held all 66. The decision lineage and `data/audit.jsonl` keep the full history; the in-memory aggregates restart.
+One observation from that restart: the telemetry half of `/runs/{id}/trace` held only the new process's 9 events while the `decisions` list held all 66. The decision lineage and `data/audit.jsonl` keep the full history; the in-memory event log restarts. At the time, `GET /metrics` also restarted from zero (`runs_started: 0` with `runs_succeeded: 1`). That has since been changed: the API now rebuilds the aggregate counters from the stored runs at start-up (`replay_runs`), and a restart of a server on a database holding one finished run reported `runs_started: 1, runs_succeeded: 1` while its `/trace` had 0 events and 111 decisions. Only the event log is lost.

@@ -35,7 +35,7 @@ from scenarios.common import resolve_llm, with_llm
 
 from .contracts import RunStore, TelemetrySink
 from .llm import get_settings
-from .engine import RunNotAmendable
+from .engine import MAX_REQUIREMENT_CHARS, RunNotAmendable
 from .models import (
     TERMINAL_RUN_STATES,
     TERMINAL_STAGE_STATES,
@@ -103,7 +103,8 @@ class ErrorResponse(BaseModel):
 # ============================================================================ schemas
 class CreateRunRequest(BaseModel):
     scenario: str = Field(description="Name of a scenario from GET /scenarios")
-    requirement: Optional[str] = Field(default=None, min_length=1, description="Overrides the scenario's requirement")
+    requirement: Optional[str] = Field(default=None, min_length=1, max_length=MAX_REQUIREMENT_CHARS,
+                                       description="Overrides the scenario's requirement")
     params: dict[str, Any] = Field(default_factory=dict, description="Merged over the scenario's default params")
 
 
@@ -416,6 +417,8 @@ async def create_run(body: CreateRunRequest, wait: bool = WaitParam, timeout: fl
         raise ApiError(422, "unknown_scenario", f"unknown scenario '{body.scenario}'; known: {sorted(scenarios)}")
     if "auto_approve" in body.params:  # approvals are human decisions; no client may switch them off
         raise ApiError(422, "auto_approve_not_allowed", "params.auto_approve is not allowed over the API")
+    if "llm" in body.params and not isinstance(body.params["llm"], bool):  # '0' / 'false' are truthy strings
+        raise ApiError(422, "invalid_llm_param", "params.llm must be the JSON value true or false")
     if body.params.get("llm") and not get_settings().configured:
         raise ApiError(422, "llm_not_configured", "params.llm needs GEMINI_API_KEY (set it in .env)")
     if resolve_llm(body.params):  # swap in the LLM-backed graph; deterministic agents stay as fallback
@@ -462,6 +465,10 @@ async def decide(ctx: Ctx, run_id: str, approval_id: str, body: ApprovalDecision
     key = (run_id, approval_id)
     if approval.status != ApprovalStatus.PENDING or key in ctx.supervisor.resolving:
         raise ApiError(409, "approval_not_pending", f"approval '{approval_id}' is not pending")
+    try:
+        ctx.engine.check_comment(run_id, body.comment, actor)  # a bad comment is a clean 4xx, not a crashed task
+    except PolicyViolation as violation:
+        raise ApiError(422, "policy_violation", violation.message)
     action = ctx.engine.approve if status == ApprovalStatus.APPROVED else ctx.engine.reject
     # engine.approve() resumes a paused run, i.e. it can take as long as the rest of the run,
     # so it runs as a background task exactly like POST /runs.

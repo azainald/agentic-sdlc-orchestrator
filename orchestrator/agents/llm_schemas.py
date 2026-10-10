@@ -5,9 +5,10 @@ so a model cannot smuggle extra fields such as ``approved: true`` into an artifa
 tie the model to the product's real vocabulary (feature keys, question topics)."""
 from __future__ import annotations
 
+import re
 from typing import Annotated, Literal, Optional
 
-from pydantic import BaseModel, Field, StringConstraints
+from pydantic import AfterValidator, BaseModel, Field, StringConstraints
 
 from .features import FEATURES
 from .requirements import QUESTIONS
@@ -15,9 +16,26 @@ from .requirements import QUESTIONS
 FeatureKey = Literal[tuple(FEATURES)]      # alias, ttl, analytics, ...
 Topic = Literal[tuple(QUESTIONS)]          # scope, accountability, privacy, ...
 
-Short = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=200)]
-Medium = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=400)]
-Long = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=1200)]
+# Model text ends up in terminals, reports and documents. A control character (ESC, CR, backspace, C1 ...) could
+# redraw or fake what a human reviews, so any answer containing one is INVALID (-> retry -> deterministic fallback).
+# Single-line fields allow no control character at all; only the multi-line narrative may use newline and tab.
+_LINE_CONTROL = re.compile("[\x00-\x1f\x7f-\x9f]")
+_TEXT_CONTROL = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+
+
+def _no_control(pattern: re.Pattern):
+    def check(value: str) -> str:
+        if pattern.search(value):
+            raise ValueError("contains a control character")
+        return value
+    return AfterValidator(check)
+
+
+Line, Text = _no_control(_LINE_CONTROL), _no_control(_TEXT_CONTROL)
+Short = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=200), Line]
+Medium = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=400), Line]
+Long = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=1200), Text]
+Tag = Annotated[str, StringConstraints(strip_whitespace=True, max_length=40), Line]
 
 
 class OpenQuestion(BaseModel):
@@ -33,7 +51,7 @@ class RequirementsOut(BaseModel):
     assumptions: list[Short] = Field(min_length=1, max_length=8)
     detected_features: list[FeatureKey] = Field(default_factory=list, max_length=len(FEATURES))
     open_questions: list[OpenQuestion] = Field(default_factory=list, max_length=6)
-    vague_terms: list[Annotated[str, StringConstraints(max_length=40)]] = Field(default_factory=list, max_length=8)
+    vague_terms: list[Tag] = Field(default_factory=list, max_length=8)
 
 
 class Proposal(BaseModel):
@@ -48,14 +66,14 @@ class NormalizeOut(BaseModel):
 
 
 class ComponentOut(BaseModel):
-    name: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=40)]
-    module: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=40)]
+    name: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=40), Line]
+    module: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=40), Line]
     responsibility: Medium
 
 
 class DataChange(BaseModel):
     change: Medium
-    feature: Annotated[str, StringConstraints(max_length=30)]
+    feature: Annotated[str, StringConstraints(max_length=30), Line]
 
 
 class ApiDelta(DataChange):
@@ -67,7 +85,7 @@ class DecisionOut(BaseModel):
     context: Medium
     decision: Medium
     consequence: Medium
-    feature: Annotated[str, StringConstraints(max_length=30)]
+    feature: Annotated[str, StringConstraints(max_length=30), Line]
 
 
 class ArchitectureOut(BaseModel):

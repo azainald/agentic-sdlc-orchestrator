@@ -30,17 +30,20 @@ decides what else must run. That is why the human trigger needs no special graph
      `system` ... are refused).
    * the run must exist (`KeyError`) and not be finished or stopping (`RunNotAmendable`, a `ValueError`).
    * the text must be non-empty, at most 2000 characters, and different from the current one (a whitespace-only
-     difference counts as identical). `comment` is at most 2000 characters.
+     difference counts as identical). `comment` is at most 2000 characters and passes the same policy scan as the
+     text (so does the `comment` of an approve/reject).
    * the text passes the same **policy scan as artifacts** (`no_secrets`, `safe_destination_urls`). A violation
      raises `PolicyViolation`, the run is left exactly as it was, and the refusal is audited as a `policy`
      decision (it names the rule and field, never the value). This is *not* the artifact "hard stop": an
      operator typo must not kill a run, but a secret must never enter the requirement.
-2. **Record the decision** `kind="replan"`, `outcome="requirement_amended"` with `actor`, `comment`, the SHA-256
-   of the old and new text, the stages that were re-queued and the approvals that were withdrawn. A telemetry
+2. **Record the decision** `kind="replan"`, `outcome="requirement_amended"` with `actor`, `comment`, the old and new
+   text (`old_requirement`, `new_requirement`, bounded to 2000 characters) and their SHA-256, the stages that were re-queued and the approvals that were withdrawn. A telemetry
    event is emitted and `metrics.replans` is incremented.
 3. **Set `run.requirement`** and re-queue the root stages (stages without dependencies) plus every downstream
    stage that is not `succeeded`: waiting for approval, failed, blocked, skipped. Their verdict was about the old
-   requirement. `succeeded` stages are **kept for now**.
+   requirement. `succeeded` stages are **kept for now**, except stages declared `reads_requirement` (the agent
+   quotes the raw requirement text, e.g. documentation: its changelog), which are re-queued too, because the hash
+   comparison cannot see a change in text they read directly.
 4. **Withdraw every pending approval** of a re-queued stage. A human was asked about evidence that is about to be
    re-derived, so that question is void (status `rejected`, actor `engine`, comment "requirement amended by ...",
    one `approval / cancelled` decision; the CLI table shows it as `withdrawn by engine`). A later attempt to
@@ -49,7 +52,7 @@ decides what else must run. That is why the human trigger needs no special graph
    that has to run again will ask again.
 5. **Resume.** A paused or restarted run is resumed (`engine.run`). A live run is woken up. A stage that is
    `RUNNING` right now is never touched: when it finishes it is checked, and run again if it consumed outdated
-   input (for a root stage: if the requirement changed while it ran).
+   input (for a root stage or a `reads_requirement` stage: if the requirement changed while it ran).
 6. **The normal re-plan decides the rest.** The root re-runs and publishes. For every changed artifact
    (`_maybe_replan`), each `succeeded` stage that consumed an older version is reset to `pending`; stages that did
    not consume it keep their result. A reset stage that re-runs and reproduces the *same* artifact invalidates

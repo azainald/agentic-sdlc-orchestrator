@@ -15,9 +15,16 @@ LLM_STAGES = {"requirements", "normalize", "architecture", "documentation"}  # a
 
 def resolve_llm(params: Optional[Mapping[str, Any]] = None) -> bool:
     """Should this run use the LLM agents? An explicit ``params["llm"]`` wins; otherwise the settings decide
-    (``LLM_ENABLED`` truthy and a key present). Without opt-in the answer is False: runs stay deterministic."""
+    (``LLM_ENABLED`` truthy and a key present). Without opt-in the answer is False: runs stay deterministic.
+
+    An explicit value must be a real bool (None means "not given"): '0' or 'false' are truthy strings, and
+    silently treating them as True would switch the LLM on while the caller meant off."""
     explicit = (params or {}).get("llm")
-    return bool(explicit) if explicit is not None else get_settings().active
+    if explicit is None:
+        return get_settings().active
+    if not isinstance(explicit, bool):
+        raise ValueError(f"params.llm must be true or false, not {type(explicit).__name__} {explicit!r}")
+    return explicit
 
 
 def llm_graph(graph: list[StageSpec]) -> list[StageSpec]:
@@ -63,7 +70,8 @@ def delivery_stages(impl_ids: list[str], docs_consumes: list[str]) -> list[Stage
                   parallel_group="verify", consumes=["implementation"], timeout_ms=TESTING_TIMEOUT_MS),
         StageSpec(id="documentation", title="Generate documentation", agent="documentation",
                   depends_on=["sync"], entry_gates=["implementation_complete"], exit_gates=["docs_present"],
-                  parallel_group="verify", consumes=["implementation", *docs_consumes]),
+                  parallel_group="verify", consumes=["implementation", *docs_consumes],
+                  reads_requirement=True),  # the changelog quotes the requirement text
         StageSpec(id="release", title="Release go/no-go", agent="release", depends_on=["testing", "documentation"],
                   entry_gates=["release_ready", "docs_present", "no_policy_exceptions"],
                   requires_approval=True, approval_kind="production_release", autonomy=Autonomy.HUMAN_GATED,

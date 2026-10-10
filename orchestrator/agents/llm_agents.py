@@ -26,6 +26,7 @@ from .common import effective_requirements
 from .documentation import documentation_agent
 from .features import FEATURES
 from .llm_schemas import ArchitectureOut, NarrativeOut, NormalizeOut, RequirementsOut
+from .requirements import is_explicitly_vague
 
 MAX_REQUIREMENT_CHARS = 2000
 OPEN, CLOSE = "<untrusted_requirement>", "</untrusted_requirement>"
@@ -94,6 +95,10 @@ def requirements_llm(client: LLMClient, ctx: AgentContext) -> AgentResult:
     out: RequirementsOut = ask(client, prompt, RequirementsOut)
     if not out.detected_features and not out.open_questions:
         raise LLMInvalidOutput("no feature detected and no open question raised")
+    if not out.open_questions and is_explicitly_vague(ctx.requirement):
+        # The deterministic detector says this request is ambiguous ('Make links safer'); a model may not switch
+        # ambiguity detection off (that would skip the human interpretation approval). Invalid -> retry -> fallback.
+        raise LLMInvalidOutput("request is vague by the deterministic check but the model raised no open question")
     features = list(dict.fromkeys(out.detected_features))
     content = {
         "problem": out.problem,

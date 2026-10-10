@@ -1,13 +1,25 @@
 """Plain-text (ASCII) rendering of a run for the CLI. No I/O here: functions return strings."""
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from orchestrator.models import ApprovalStatus, Run, StageRuntime
 
+# Control characters other than newline and tab. ESC (ANSI sequences), CR (overwrites a line), BS, BEL and the
+# C1 range (0x9b is a one-byte CSI) let text that came from an artifact, a model or a requirement redraw or fake
+# terminal output: the approver must see what is really there.
+_CONTROL = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+
+
+def safe(text: Any) -> str:
+    """Neutralise terminal control characters: each becomes a visible, inert escape such as ``\\x1b``."""
+    return _CONTROL.sub(lambda m: "\\x%02x" % ord(m.group()), str(text))
+
 
 def table(headers: list[str], rows: list[list[Any]]) -> str:
-    cells = [[str(c) for c in row] for row in rows]
+    headers = [safe(h) for h in headers]
+    cells = [[safe(c) for c in row] for row in rows]
     widths = [max([len(h), *(len(r[i]) for r in cells)]) for i, h in enumerate(headers)]  # no rows: headers only
     line = lambda row: "  ".join(c.ljust(w) for c, w in zip(row, widths)).rstrip()  # noqa: E731
     return "\n".join([line(headers), line(["-" * w for w in widths]), *(line(r) for r in cells)])
@@ -106,7 +118,7 @@ def format_run(run: Run) -> str:
     out += ["", "Artifacts:", table(["NAME", "VER", "PRODUCED BY", "SHA256"],
                                     [[a.name, a.version, a.produced_by, a.sha256] for a in run.artifacts.values()])]
     out += ["", format_metrics(run)]
-    return "\n".join(out)
+    return safe("\n".join(out))
 
 
 def format_metrics(run: Run) -> str:
@@ -128,13 +140,19 @@ def review_lines(run: Run, approval) -> list[str]:
     """What the human is being asked to approve (the evidence behind the pause)."""
     arts = {n: a.content for n, a in run.artifacts.items()}
     if approval.kind == "requirement_interpretation":
-        return [f"  - {q['question']}\n      proposed: {q['proposed_resolution']}"
-                for q in arts.get("normalized_requirements", {}).get("open_questions", [])]
+        questions = arts.get("normalized_requirements", {}).get("open_questions", [])
+        if not questions:
+            return ["  NOTHING TO REVIEW - approving an empty interpretation (no question or proposal exists)"]
+        # Everything the approval applies is shown: approving also ADDS the feature named in adds_feature.
+        return [safe(f"  - {q['question']}\n      proposed: {q['proposed_resolution']}\n"
+                     f"      adds feature: {q.get('adds_feature') or '(none)'}\n"
+                     f"      rationale: {q.get('rationale', '')}")
+                for q in questions]
     if approval.kind == "public_api_change":
-        return [f"  - [{c['feature']}] {c['change']}" for c in arts.get("impact", {}).get("public_api_changes", [])]
+        return [safe(f"  - [{c['feature']}] {c['change']}") for c in arts.get("impact", {}).get("public_api_changes", [])]
     if approval.kind == "production_release":
         rc = arts.get("test_report", {})
-        return [f"  - tests: {rc.get('passed', '?')} passed, {rc.get('failed', '?')} failed",
+        return [safe(f"  - tests: {rc.get('passed', '?')} passed, {rc.get('failed', '?')} failed"),
                 f"  - documentation: {len(arts.get('documentation', {}).get('files', []))} file(s)"]
     return []
 
@@ -160,7 +178,7 @@ def resume_hint(run: Run, db: str, default_db: str, audit: str | None = None,
     if lines:
         lines.append(f'  amend the requirement instead: python -m scenarios amend {run.id} --requirement "..." '
                      f"--actor you{db_flag}")
-    return "\n".join(lines)
+    return safe("\n".join(lines))
 
 
 def run_summary(run: Run) -> dict[str, Any]:
