@@ -279,6 +279,9 @@ async def test_fallback_fails_then_rollback_and_downstream_skipped(build):
     assert (run.metrics.retries, run.metrics.fallbacks, run.metrics.rollbacks) == (1, 1, 1)
     assert run.metrics.stages_succeeded == 1 and run.metrics.stages_failed == 1
     assert decisions(run, "rollback", "applied")
+    # the failed fallback attempt is a `fallback` decision of its own, not a second kind of 'retry'
+    assert [d.inputs["fallback"] for d in decisions(run, "retry", "failed")] == [False, False]  # 2 primary attempts
+    assert [d.inputs["fallback"] for d in decisions(run, "fallback", "failed")] == [True]
 
 
 async def test_failure_without_rollback_marks_failed_and_captures_error(build):
@@ -632,8 +635,9 @@ def test_create_run_rejects_policy_violating_stage(build):
 # --------------------------------------------------------------- re-plan
 async def test_replan_resets_downstream_when_upstream_artifact_changes(build):
     """'consumer' (and its dependent 'report') finish BEFORE 'producer' publishes
-    the 'spec' artifact they declared they consume. When it lands they used stale
-    input, so both are reset and run again, this time seeing the spec."""
+    the 'spec' artifact they declared they consume. When it lands 'consumer' used stale
+    input, so it is reset and runs again, this time seeing the spec. Its new analysis differs,
+    so the same hash comparison then resets 'report' (the cascade is lazy, one hop at a time)."""
     report_done = threading.Event()
     seen_specs = []
 
@@ -659,16 +663,43 @@ async def test_replan_resets_downstream_when_upstream_artifact_changes(build):
     assert seen_specs == [None, {"v": "final"}]  # second pass saw the new artifact
     assert run.stages["consumer"].runs == 2 and run.stages["report"].runs == 2
     assert run.stages["producer"].runs == 1
-    assert run.metrics.replans == 1
+    assert run.metrics.replans == 2
     assert run.artifacts["analysis"].content == {"spec_seen": "final"}
     assert run.artifacts["analysis"].version == 2
     assert run.stages["consumer"].input_hashes["spec"] == run.artifacts["spec"].sha256
 
-    [replan] = decisions(run, "replan")
-    assert replan.outcome == "applied" and replan.stage_id == "producer"
-    assert replan.inputs["reset"] == ["consumer", "report"]
-    assert replan.inputs["changed"] == ["spec"]
-    assert "consumer" in replan.rationale and "spec" in replan.rationale
+    first, second = decisions(run, "replan")
+    assert first.outcome == "applied" and first.stage_id == "producer"
+    assert first.inputs["reset"] == ["consumer"]
+    assert first.inputs["changed"] == ["spec"]
+    assert "consumer" in first.rationale and "spec" in first.rationale
+    assert second.stage_id == "consumer" and second.inputs["reset"] == ["report"]
+    assert second.inputs["changed"] == ["analysis"]
+
+
+async def test_replan_is_selective_a_reset_stage_that_reproduces_its_output_resets_nothing_downstream(build):
+    """'mid' consumed an outdated 'spec' and runs again, but its output does not depend on the change, so
+    'tail' (which only consumes mid's output) keeps its result: one execution, no second re-plan."""
+    tail_done = threading.Event()
+
+    def producer(ctx):
+        assert tail_done.wait(WAIT_S)
+        return AgentResult(artifacts={"spec": {"v": 1}})
+
+    def mid(ctx):
+        return AgentResult(artifacts={"mid_out": {"constant": True}})
+
+    def tail(ctx):
+        tail_done.set()
+        return AgentResult(artifacts={"tail_out": {"ok": True}})
+
+    calls = {k: Calls(v) for k, v in {"producer": producer, "mid": mid, "tail": tail}.items()}
+    engine = build(calls)
+    run = await execute(engine, [spec("producer"), spec("mid", consumes=["spec"]),
+                                 spec("tail", ["mid"], consumes=["mid_out"])])
+    assert run.state == R.SUCCEEDED
+    assert (calls["mid"].count, calls["tail"].count) == (2, 1)
+    assert run.metrics.replans == 1 and run.stages["tail"].runs == 1
 
 
 async def test_no_replan_when_consumer_already_saw_current_artifact(build):

@@ -11,11 +11,20 @@ needed. When nothing is in flight and a stage is waiting for a human, ``run()``
 saves the run and returns; ``approve()``/``reject()`` later resume it, even from
 a brand-new ``Engine`` sharing the same store.
 
+Re-plan, in one paragraph: every stage records the hash of each artifact it consumed. When a stage publishes a
+CHANGED artifact, SUCCEEDED stages that consumed an older version are reset to PENDING; stages that consumed
+nothing that changed keep their results. The cascade is lazy: a reset stage that re-runs and reproduces the same
+artifacts invalidates nothing further. ``amend_requirement()`` is the human trigger: it re-queues the root
+stages with the new requirement text, cancels pending approvals (their evidence is about to change) and lets the
+same hash comparison decide what else must run again. See docs/REPLAN.md.
+
 Known limitations (documented, not fixed):
 * Resuming the same run from two processes at once is unsafe: the store has no compare-and-swap, so the
   last writer wins. Run one resumer per run (the HTTP API guards this inside a single process only).
 * After a restart, a stage that was RUNNING is re-queued, and if it needs approval it asks for a NEW
   approval even though the earlier one was granted (see ``_recover_interrupted``).
+* An amendment cannot interrupt a stage that is RUNNING: that stage finishes, and is then re-run if it
+  consumed outdated input (roots: if the requirement changed while they ran).
 * A Python thread cannot be killed, so a timed-out agent keeps running in its worker thread until it returns.
 """
 from __future__ import annotations
@@ -28,7 +37,7 @@ from typing import Any, Awaitable, Callable, Optional
 
 from .contracts import RunStore, TelemetrySink
 from .gates import GATES, run_gates
-from .graph import DEAD, READY, dependency_status, downstream, topological_order, validate_graph
+from .graph import DEAD, READY, WAIT, dependency_status, downstream, topological_order, validate_graph
 from .models import (
     TERMINAL_RUN_STATES,
     TERMINAL_STAGE_STATES,
@@ -54,6 +63,12 @@ from .models import (
 from .policy import HIGH_IMPACT, PolicyEngine, PolicyViolation, approval_kind_of, validate_human_actor
 
 MAX_REPLANS = 3  # per source stage: a re-plan loop can never spin forever; hitting it FAILS the run
+MAX_REQUIREMENT_CHARS = 2000  # an amended requirement is bounded text, scanned by the policy like an artifact
+MAX_COMMENT_CHARS = 2000
+
+
+class RunNotAmendable(ValueError):
+    """The run exists but cannot take a new requirement (finished, or already stopping): a state conflict."""
 
 
 class _StopRequested(Exception):
@@ -243,11 +258,14 @@ class Engine:
         """One scheduling pass. Skips dead branches, evaluates entry gates and
         approvals, and returns the ids of stages to launch right now."""
         launches: list[str] = []
+        settled: dict[str, bool] = {}
         for stage_id in order:  # topological, so a skip cascades down in one pass
             st = run.stages[stage_id]
             if st.state in (StageState.PENDING, StageState.READY):  # READY = a human approved it meanwhile
                 approved = st.state == StageState.READY
                 status = dependency_status(st.spec, {i: s.state for i, s in run.stages.items()})
+                if status == READY and not self._inputs_settled(run, st.spec, settled):
+                    status = WAIT  # an ancestor is being re-executed: its dependents' results may be stale
                 if status == DEAD:
                     st.state = StageState.SKIPPED
                     self._record(run, "stage", "an upstream stage failed or was skipped", "skipped", stage_id,
@@ -260,6 +278,21 @@ class Engine:
                     self._record(run, "stage", "dependencies changed after approval; waiting again", "requeued",
                                  stage_id)
         return launches
+
+    def _inputs_settled(self, run: Run, spec: StageSpec, memo: dict[str, bool]) -> bool:
+        """Would ``spec`` be consistent with its whole upstream chain? Lazy re-plan keeps SUCCEEDED stages until their
+        inputs are proven stale, so a stage may have all direct dependencies SUCCEEDED while one of THEIR ancestors
+        is being re-executed. Starting it then would build on (or ask a human to approve) evidence about to change."""
+        if not spec.depends_on:
+            return True
+        results = [self._settled(run, d, memo) for d in spec.depends_on]
+        return any(results) if spec.join == "any" else all(results)
+
+    def _settled(self, run: Run, stage_id: str, memo: dict[str, bool]) -> bool:
+        if stage_id not in memo:
+            st = run.stages[stage_id]
+            memo[stage_id] = st.state == StageState.SUCCEEDED and self._inputs_settled(run, st.spec, memo)
+        return memo[stage_id]
 
     def _admit(self, run: Run, st: StageRuntime, approved: bool = False) -> bool:
         """Entry gates, then approval. True means: launch now. ``approved``: a human already said yes, but
@@ -288,6 +321,10 @@ class Engine:
             self._record(run, "stage", st.error, "failed", stage_id)
             return
         if st.state == StageState.SUCCEEDED:
+            if self._requeue_if_requirement_changed(run, st):
+                if changed:  # what it published is still in run.artifacts until the re-run replaces it
+                    self._maybe_replan(run, stage_id, changed)
+                return  # it ran on the old requirement text: run it again on the amended one
             if self._replan_if_self_stale(run, st):
                 return  # it will run again on fresh input; its outputs are republished then
             if changed:
@@ -301,6 +338,7 @@ class Engine:
         st.started_at, st.ended_at = now(), None
         st.attempts, st.error, st.used_fallback = 0, None, False
         st.runs += 1
+        st.requirement_fp = fingerprint(run.requirement)
         st.input_hashes = {n: run.artifacts[n].sha256 if n in run.artifacts else "" for n in spec.consumes}
         self._record(run, "stage", f"stage started (execution #{st.runs})", "started", spec.id,
                      input_hashes=st.input_hashes)
@@ -354,7 +392,8 @@ class Engine:
             if error is None:
                 return changed
             st.error = error
-            self._record(run, "retry", f"attempt {attempt}/{max_attempts} with '{agent_name}' failed: {error}",
+            self._record(run, "fallback" if fallback else "retry",
+                         f"attempt {attempt}/{max_attempts} with '{agent_name}' failed: {error}",
                          "failed", spec.id, agent=agent_name, fallback=fallback)
             if attempt < max_attempts:
                 run.metrics.retries += 1
@@ -372,6 +411,7 @@ class Engine:
                        fallback: bool) -> tuple[Optional[str], set[str]]:
         """One agent call + policy + exit gates. Returns (error, changed).
         Artifacts are only published if the whole attempt succeeds."""
+        st.requirement_fp = fingerprint(run.requirement)  # exactly the text this attempt's agent will read
         ctx = self._context(run, st, fallback)
         timeout_ms = st.spec.timeout_ms
         try:
@@ -492,11 +532,18 @@ class Engine:
         self._record(run, "approval", comment or f"{status.value} by {actor}", status.value, st.spec.id,
                      approval_id=approval_id, actor=actor, approval_kind=approval.kind)
 
-    def _cancel_approvals(self, run: Run, stage_id: str, reason: str) -> None:
+    def _cancel_approvals(self, run: Run, stage_id: str, reason: str) -> list[str]:
+        """Withdraw the pending approvals of a stage (a decision is recorded). Returns the cancelled ids."""
+        cancelled = []
         for approval in run.approvals.values():
             if approval.stage_id == stage_id and approval.status == ApprovalStatus.PENDING:
                 approval.status, approval.actor = ApprovalStatus.REJECTED, "engine"
                 approval.resolved_at, approval.comment = now(), reason
+                cancelled.append(approval.id)
+        if cancelled:
+            self._record(run, "approval", f"pending approval withdrawn: {reason}", "cancelled", stage_id,
+                         approval_ids=cancelled, reason=reason)
+        return cancelled
 
     # ================================================================ re-plan
     def _maybe_replan(self, run: Run, source_id: str, changed: set[str]) -> None:
@@ -539,22 +586,29 @@ class Engine:
     def _replan(self, run: Run, source_id: str, stale: dict[str, dict[str, dict[str, str]]], reason: str,
                 exclude: frozenset[str] | set[str] = frozenset()) -> bool:
         """Reset the stale stages and everything downstream of them. If ``source_id`` already caused
-        MAX_REPLANS re-plans, FAIL the run's stale stages instead (never silently carry on with stale work)."""
+        MAX_REPLANS re-plans, FAIL the run's stale stages instead (never silently carry on with stale work).
+
+        Selective on purpose: only the stages that consumed outdated input are reset, plus downstream stages that
+        had not succeeded (waiting for approval, failed, skipped ...: their verdict was about the old world).
+        A downstream stage that already SUCCEEDED is kept: if the reset stage re-runs and publishes a different
+        artifact, the normal hash comparison resets its consumers then; if it reproduces the same artifact,
+        nothing downstream needs to run again."""
         if not stale:
             return False
         specs = [s.spec for s in run.stages.values()]
-        to_reset = set(stale)
+        cascade = set(stale)
         for stage_id in stale:
-            to_reset |= downstream(specs, stage_id)
-        to_reset = {i for i in to_reset
-                    if i not in exclude and run.stages[i].state not in (StageState.PENDING, StageState.RUNNING)}
+            cascade |= downstream(specs, stage_id)
+        to_reset = {i for i in cascade
+                    if i not in exclude and run.stages[i].state not in (StageState.PENDING, StageState.RUNNING)
+                    and (i in stale or run.stages[i].state != StageState.SUCCEEDED)}
         if not to_reset:
             return False
 
         reset_ids = [i for i in run.stages if i in to_reset]  # graph order, for a readable record
         applied = sum(1 for d in run.decisions if d.kind == "replan" and d.outcome == "applied" and d.stage_id == source_id)
-        if applied >= MAX_REPLANS:
-            failed = [i for i in reset_ids if run.stages[i].state == StageState.SUCCEEDED]
+        if applied >= MAX_REPLANS:  # fail loud: everything that could rest on the stale stages goes down with them
+            failed = [i for i in run.stages if i in cascade - exclude and run.stages[i].state == StageState.SUCCEEDED]
             for stage_id in failed:
                 st = run.stages[stage_id]
                 st.state, st.error, st.ended_at = StageState.FAILED, "stale_after_replan_limit", now()
@@ -570,12 +624,103 @@ class Engine:
                      "applied", source_id, stale=stale, reset=reset_ids, changed=sorted({n for d in stale.values() for n in d}))
         return True
 
-    def _reset_stage(self, run: Run, st: StageRuntime) -> None:
-        self._cancel_approvals(run, st.spec.id, "superseded by re-plan")
+    def _reset_stage(self, run: Run, st: StageRuntime, reason: str = "superseded by re-plan") -> list[str]:
+        cancelled = self._cancel_approvals(run, st.spec.id, reason)
         st.state = StageState.PENDING
         st.attempts, st.error, st.used_fallback = 0, None, False
         st.started_at = st.ended_at = None
         st.input_hashes = {}  # `runs` is kept: it counts executions across re-plans
+        return cancelled
+
+    # ============================================================ amend the requirement (human re-plan)
+    async def amend_requirement(self, run_id: str, requirement: str, actor: str, comment: str = "") -> Run:
+        """A named human changes the requirement of a run that is not finished.
+
+        1. validate (actor, run state, text length, text differs, policy scan): nothing is changed on failure;
+        2. record the decision, set ``run.requirement``, re-queue the root stages and withdraw every pending
+           approval, because the evidence it was asked about is about to be re-derived;
+        3. the normal hash comparison does the rest: roots publish new artifacts, stages whose consumed
+           artifacts changed are reset and run again, the others keep their results; approvals are asked again.
+
+        A paused or restarted run is resumed here (like ``approve``); a live run is just woken up. A stage that
+        is RUNNING right now is never touched: it finishes first and is then re-checked."""
+        live = self._live.get(run_id)
+        run = live if live is not None else self._require(run_id)
+        actor, text = self._check_amendment(run, requirement, actor, comment)
+        self._apply_amendment(run, text, actor, comment)
+        self._save(run)
+        if live is not None:
+            self._wake[run_id].set()
+            return live
+        return await self.run(run_id)
+
+    def check_amendment(self, run_id: str, requirement: str, actor: str, comment: str = "") -> tuple[str, str]:
+        """Synchronous pre-flight of ``amend_requirement`` (the API validates before it goes to the background).
+        Returns (actor, requirement) cleaned up, or raises KeyError / RunNotAmendable / ValueError / PolicyViolation."""
+        run = self._live.get(run_id) or self._require(run_id)
+        return self._check_amendment(run, requirement, actor, comment)
+
+    def _check_amendment(self, run: Run, requirement: str, actor: str, comment: str) -> tuple[str, str]:
+        actor = self._human(actor)
+        if run.state in TERMINAL_RUN_STATES:
+            raise RunNotAmendable(f"run '{run.id}' is already {run.state.value}; start a new run instead")
+        if run.stop_requested:
+            raise RunNotAmendable(f"run '{run.id}' is being stopped and cannot take a new requirement")
+        if not isinstance(requirement, str) or not requirement.strip():
+            raise ValueError("requirement must be a non-empty string")
+        text = requirement.strip()
+        if len(text) > MAX_REQUIREMENT_CHARS:
+            raise ValueError(f"requirement is {len(text)} characters; the limit is {MAX_REQUIREMENT_CHARS}")
+        if not isinstance(comment, str) or len(comment) > MAX_COMMENT_CHARS:
+            raise ValueError(f"comment must be text of at most {MAX_COMMENT_CHARS} characters")
+        if " ".join(text.split()) == " ".join(run.requirement.split()):
+            raise ValueError("the new requirement is identical to the current one; nothing to re-plan")
+        try:
+            self.policy.check_artifact("requirement", {"requirement": text})
+        except PolicyViolation as violation:
+            # The amendment is refused and the run is left as it was; only the refusal is audited.
+            self._record(run, "policy", f"requirement amendment refused: {violation.message}", "fail",
+                         rule=violation.rule, actor=actor)
+            self._save(run)
+            raise
+        return actor, text
+
+    def _apply_amendment(self, run: Run, text: str, actor: str, comment: str) -> None:
+        old_fp, new_fp = fingerprint(run.requirement), fingerprint(text)
+        run.requirement = text
+        run.metrics.replans += 1
+        roots = [i for i, s in run.stages.items() if not s.spec.depends_on]
+        specs = [s.spec for s in run.stages.values()]
+        affected = set(roots)
+        for root in roots:
+            affected |= downstream(specs, root)
+        reason = f"requirement amended by {actor}"
+        busy = [i for i in roots if run.stages[i].state == StageState.RUNNING]
+        requeued = [  # graph order. SUCCEEDED non-roots are kept until the hash comparison proves their input changed
+            i for i, st in run.stages.items()
+            if i in affected and st.state not in (StageState.PENDING, StageState.RUNNING)
+            and (st.state != StageState.SUCCEEDED or i in roots)
+        ]
+        cancelled = [a.id for a in run.approvals.values() if a.stage_id in requeued and a.status == ApprovalStatus.PENDING]
+        self._record(run, "replan",
+                     reason + (f": {comment}" if comment else "") + f". Re-queued {requeued or 'nothing'}"
+                     + (f"; {busy} is running and will be re-checked when it finishes" if busy else "")
+                     + "; downstream stages re-run only if the artifacts they consume change",
+                     "requirement_amended", actor=actor, comment=comment, old_requirement_sha256=old_fp,
+                     new_requirement_sha256=new_fp, requeued=requeued, running_roots=busy,
+                     cancelled_approvals=cancelled)
+        for stage_id in requeued:
+            self._reset_stage(run, run.stages[stage_id], reason)
+
+    def _requeue_if_requirement_changed(self, run: Run, st: StageRuntime) -> bool:
+        """A root stage just succeeded. If the requirement was amended while it ran, its output describes the old
+        text: run it again. (Non-root stages read the requirement through artifacts, which the hash check covers.)"""
+        if run.stop_requested or st.spec.depends_on or st.requirement_fp == fingerprint(run.requirement):
+            return False
+        self._record(run, "replan", "requirement was amended while the stage ran; running it again on the new text",
+                     "requeued", st.spec.id)
+        self._reset_stage(run, st, "requirement amended while the stage ran")
+        return True
 
     # ================================================================ finishing
     def _skip_unstarted(self, run: Run) -> None:

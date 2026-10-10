@@ -6,7 +6,8 @@ a fully isolated app (this is what the tests rely on).
 
 Background execution, in short: ``POST /runs`` creates the run (cheap, sync),
 then starts ``engine.run(id)`` as an asyncio task and answers ``202`` straight
-away. ``approve``/``reject`` do the same with ``engine.approve/reject``. The
+away. ``approve``/``reject``/``amend`` do the same with ``engine.approve/reject/amend_requirement``
+(``amend`` validates synchronously first, so a bad request is a clean 4xx, never a crashed background task). The
 ``Supervisor`` below owns those tasks (strong references, cleanup on finish, a
 failure handler, cancellation on shutdown). Clients either poll ``GET /runs/{id}``
 or add ``?wait=true`` to block until the run is terminal or waiting for a human.
@@ -32,6 +33,7 @@ from typing_extensions import Annotated
 from scenarios.base import Scenario
 
 from .contracts import RunStore, TelemetrySink
+from .engine import RunNotAmendable
 from .models import (
     TERMINAL_RUN_STATES,
     TERMINAL_STAGE_STATES,
@@ -43,10 +45,11 @@ from .models import (
     RunState,
     StageSpec,
     StageState,
+    fingerprint,
     now,
 )
 from .policy import PolicyViolation, validate_human_actor
-from .telemetry import to_prometheus_text
+from .telemetry import replay_runs, to_prometheus_text
 
 log = logging.getLogger("orchestrator.api")
 
@@ -109,6 +112,14 @@ class ApprovalDecision(BaseModel):
     comment: str = Field(default="", max_length=2000)
 
 
+class AmendRequest(BaseModel):
+    """A named human changes the requirement of a run that is not finished (see docs/REPLAN.md)."""
+
+    requirement: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=2000)]
+    actor: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=200)]
+    comment: str = Field(default="", max_length=2000)
+
+
 class HealthResponse(BaseModel):
     status: str = "ok"
 
@@ -133,6 +144,14 @@ class ApprovalAccepted(BaseModel):
     approval_id: str
     decision: ApprovalStatus
     actor: str
+    links: dict[str, str]
+
+
+class AmendAccepted(BaseModel):
+    run_id: str
+    actor: str
+    previous_requirement_sha256: str
+    requirement_sha256: str
     links: dict[str, str]
 
 
@@ -188,7 +207,9 @@ class RunView(BaseModel):
 
 class TraceView(BaseModel):
     run_id: str
-    events: list[dict[str, Any]] = Field(description="Telemetry audit events, in order")
+    events: list[dict[str, Any]] = Field(
+        description="Telemetry audit events, in order. This is a bounded IN-MEMORY buffer: it is empty for runs "
+                    "that finished before the last restart. The durable record is `decisions` (stored on the run)")
     decisions: list[DecisionRecord] = Field(description="Decision lineage kept on the run")
 
 
@@ -469,6 +490,49 @@ async def reject(run_id: str, approval_id: str, body: ApprovalDecision, wait: bo
     return await decide(ctx, run_id, approval_id, body, ApprovalStatus.REJECTED, wait, timeout)
 
 
+async def _amend_in_background(engine: Any, run_id: str, requirement: str, actor: str, comment: str) -> None:
+    """The request already validated everything. A conflict that appeared since (the run just finished, or a
+    second amendment with the same text won the race) is logged and dropped: it must not mark the run as crashed."""
+    try:
+        await engine.amend_requirement(run_id, requirement, actor, comment)
+    except (ValueError, PolicyViolation, KeyError) as exc:
+        log.warning("amendment of %s no longer applicable: %s", run_id, exc)
+
+
+@router.post("/runs/{run_id}/amend", tags=["runs"], response_model=None, status_code=202,
+             responses={202: {"model": AmendAccepted, "description": "Amendment accepted; the run re-plans in the background"},
+                        200: {"model": RunView, "description": "With wait=true: the run once settled (or on timeout)"},
+                        **ERRORS})
+async def amend_run(run_id: str, body: AmendRequest, wait: bool = WaitParam, timeout: float = TimeoutParam,
+                    ctx: Ctx = Depends(get_ctx)) -> JSONResponse:
+    """Change the requirement of a run that is not finished. ``actor`` is mandatory and attributed.
+
+    The new text is length-limited and passes the same policy scan as artifacts. Root stages run again; only
+    stages whose consumed artifacts change run again after them; pending approvals are withdrawn and asked
+    again on the new evidence. 404 unknown run, 409 finished or stopping run, 422 bad actor/text/policy."""
+    run = find_run(ctx, run_id)
+    before = run.requirement
+    try:
+        validate_human_actor(body.actor)  # rejects the engine's own machine actors
+    except ValueError as exc:
+        raise ApiError(422, "invalid_actor", str(exc))
+    try:
+        actor, requirement = ctx.engine.check_amendment(run_id, body.requirement, body.actor, body.comment)
+    except RunNotAmendable as exc:
+        raise ApiError(409, "run_already_finished" if run.state in TERMINAL_RUN_STATES else "run_stopping", str(exc))
+    except PolicyViolation as violation:
+        raise ApiError(422, "policy_violation", violation.message)
+    except ValueError as exc:
+        code = "invalid_actor" if "actor" in str(exc) else "invalid_requirement"
+        raise ApiError(422, code, str(exc))
+    ctx.supervisor.launch(run_id, _amend_in_background(ctx.engine, run_id, requirement, actor, body.comment))
+    if wait:
+        await ctx.supervisor.wait(run_id, timeout)
+        return reply(run_view(find_run(ctx, run_id)), 200)
+    return reply(AmendAccepted(run_id=run_id, actor=actor, previous_requirement_sha256=fingerprint(before),
+                               requirement_sha256=fingerprint(requirement), links=links_for(run_id)), 202)
+
+
 @router.post("/runs/{run_id}/stop", response_model=RunView, tags=["runs"],
              responses={404: ERRORS[404], 409: ERRORS[409]})
 async def stop_run(run_id: str, ctx: Ctx = Depends(get_ctx)) -> RunView:
@@ -481,7 +545,10 @@ async def stop_run(run_id: str, ctx: Ctx = Depends(get_ctx)) -> RunView:
 
 @router.get("/runs/{run_id}/trace", response_model=TraceView, tags=["runs"], responses={404: ERRORS[404]})
 async def get_trace(run_id: str, ctx: Ctx = Depends(get_ctx)) -> TraceView:
-    """Audit events (telemetry) plus the decision lineage stored on the run."""
+    """Audit events (telemetry) plus the decision lineage stored on the run.
+
+    Honesty note: ``events`` comes from the telemetry's in-memory buffer (bounded, lost on restart; the JSONL
+    audit file is the durable copy of it). ``decisions`` is persisted with the run and always complete."""
     run = find_run(ctx, run_id)
     return TraceView(run_id=run_id, events=ctx.telemetry.events_for(run_id), decisions=list(run.decisions))
 
@@ -556,6 +623,7 @@ def create_default_app(db_path: str = "data/orchestrator.db", audit_path: str = 
     for path in (db_path, audit_path):
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     store, telemetry = SqliteRunStore(db_path), Telemetry(audit_path=audit_path)
+    replay_runs(telemetry, store.list_runs())  # GET /metrics must not restart from zero after an API restart
     engine = Engine(build_agent_registry(), store=store, telemetry=telemetry)
 
     def close() -> None:

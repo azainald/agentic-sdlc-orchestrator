@@ -72,5 +72,6 @@ def documentation_agent(ctx: AgentContext) -> AgentResult:
                       "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]})
     endpoints = [f"{e['method']} {e['path']}" for e in MANIFEST["endpoints"]]
     content = {"files": files, "endpoints_documented": endpoints,
-               "summary": f"{len(files)} markdown file(s) covering {len(endpoints)} endpoint(s) in docs/generated/{target.name}/"}
+               "summary": f"{len(files)} markdown file(s) covering {len(endpoints)} endpoint(s) in docs/generated/{target.name}/",
+               "generator": "deterministic"}
     return AgentResult(artifacts={"documentation": content}, summary=content["summary"])

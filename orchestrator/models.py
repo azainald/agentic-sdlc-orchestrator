@@ -132,6 +132,7 @@ class StageRuntime(BaseModel):
     used_fallback: bool = False
     input_hashes: dict[str, str] = Field(default_factory=dict)  # artifact -> hash seen at run time
     runs: int = 0                               # how many times (re-)executed, >1 after re-plan
+    requirement_fp: str = ""                    # fingerprint of run.requirement when this stage last started
 
 
 class Artifact(BaseModel):
@@ -149,7 +150,21 @@ class DecisionRecord(BaseModel):
     ts: float = Field(default_factory=now)
     run_id: str
     stage_id: Optional[str] = None
-    kind: str          # gate | policy | retry | fallback | rollback | approval | replan | stop | start | finish
+    # Every kind the engine emits:
+    #   start     run created / started / resumed
+    #   stage     stage lifecycle: started, succeeded, failed, skipped, blocked, requeued, recovered (after a restart)
+    #   artifact  an artifact was published (sha256 + version)
+    #   gate      one entry/exit gate evaluation (pass | fail)
+    #   retry     a failed attempt of the primary agent, and the scheduled backoff
+    #   fallback  the fallback agent was tried (attempted), and its failed attempt (failed)
+    #   rollback  the rollback agent ran (applied | fail | skipped)
+    #   approval  requested | approved | rejected | cancelled | auto-approved | paused
+    #   policy    a hard-stop violation (stage fail), or a rejected requirement amendment
+    #   stop      a safe-stop request and the stages it skipped
+    #   replan    stale stages reset (applied), the cap tripped (limit_exceeded), or a human amended the
+    #             requirement (requirement_amended)
+    #   finish    the run reached a terminal state
+    kind: str
     rationale: str
     outcome: str       # pass | fail | requested | approved | rejected | applied ...
     inputs: dict[str, Any] = Field(default_factory=dict)

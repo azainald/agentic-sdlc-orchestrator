@@ -469,7 +469,7 @@ async def test_openapi_documents_every_endpoint(env):
     paths = (await env.client.get("/openapi.json")).json()["paths"]
     assert {"/health", "/scenarios", "/runs", "/runs/{run_id}", "/runs/{run_id}/stop", "/runs/{run_id}/trace",
             "/runs/{run_id}/dag", "/metrics", "/runs/{run_id}/approvals/{approval_id}/approve",
-            "/runs/{run_id}/approvals/{approval_id}/reject"} <= set(paths)
+            "/runs/{run_id}/approvals/{approval_id}/reject", "/runs/{run_id}/amend"} <= set(paths)
     json.dumps(paths)
 
 
@@ -501,3 +501,160 @@ async def test_actor_whitespace_is_stripped(env):
     run_id, approval_id = await gated_run(env)
     r = await env.client.post(approve_url(run_id, approval_id), params={"wait": "true"}, json={"actor": "  alice "})
     assert r.status_code == 200 and r.json()["approvals"][0]["actor"] == "alice"
+
+
+# --------------------------------------------------------------- amend (re-plan)
+def amend_url(run_id):
+    return f"/runs/{run_id}/amend"
+
+
+async def test_amend_is_in_the_openapi_document(env):
+    schema = (await env.client.get("/openapi.json")).json()
+    op = schema["paths"]["/runs/{run_id}/amend"]["post"]
+    assert {"202", "200", "404", "409", "422"} <= set(op["responses"])
+    assert "AmendRequest" in schema["components"]["schemas"]
+
+
+async def test_amend_a_paused_run_replans_in_the_background_and_asks_again(env):
+    run_id, approval_id = await gated_run(env)
+    r = await env.client.post(amend_url(run_id), json={"requirement": "ship two things", "actor": "alice",
+                                                       "comment": "scope grew"})
+    assert r.status_code == 202
+    body = r.json()
+    assert body["run_id"] == run_id and body["actor"] == "alice" and body["links"]["self"] == f"/runs/{run_id}"
+    assert body["previous_requirement_sha256"] != body["requirement_sha256"]
+    await env.supervisor.wait(run_id, WAIT_S)
+
+    view = (await env.client.get(f"/runs/{run_id}")).json()
+    assert view["requirement"] == "ship two things" and view["state"] == "waiting_approval"
+    statuses = {a["id"]: a["status"] for a in view["approvals"]}
+    assert statuses == {approval_id: "rejected", "ship-2": "pending"}  # the old approval is withdrawn, a new one asked
+    assert [a["id"] for a in view["pending_approvals"]] == ["ship-2"]
+    assert view["metrics"]["replans"] >= 1
+    stages = {s["id"]: s for s in view["stages"]}
+    assert stages["a"]["runs"] == 2  # the root ran again
+
+    trace = (await env.client.get(f"/runs/{run_id}/trace")).json()
+    [amended] = [d for d in trace["decisions"] if d["outcome"] == "requirement_amended"]
+    assert amended["inputs"]["actor"] == "alice" and amended["inputs"]["comment"] == "scope grew"
+    assert any(e["event"] == "replan" for e in trace["events"])
+
+    r = await env.client.post(approve_url(run_id, "ship-2"), params={"wait": "true"}, json={"actor": "bob"})
+    assert r.status_code == 200 and r.json()["state"] == "succeeded"
+
+
+async def test_amend_with_wait_returns_the_settled_run_view(env):
+    run_id, _ = await gated_run(env)
+    r = await env.client.post(amend_url(run_id), params={"wait": "true"},
+                              json={"requirement": "something else", "actor": "alice"})
+    assert r.status_code == 200 and r.json()["requirement"] == "something else"
+    assert r.json()["state"] == "waiting_approval"
+
+
+async def test_amend_a_run_that_is_still_executing(env):
+    r = await start(env, "slow", wait=False)
+    run_id = r.json()["run_id"]
+    for _ in range(200):  # wait until the slow stage is really running
+        if (await env.client.get(f"/runs/{run_id}")).json()["state"] == "running":
+            break
+        await asyncio.sleep(0.01)
+    r = await env.client.post(amend_url(run_id), json={"requirement": "new text", "actor": "alice"})
+    assert r.status_code == 202
+    await asyncio.sleep(0.05)
+    assert (await env.client.get(f"/runs/{run_id}")).json()["requirement"] == "new text"
+    GATE.set()
+    await env.supervisor.wait(run_id, WAIT_S)
+    assert (await env.client.get(f"/runs/{run_id}")).json()["state"] == "succeeded"
+
+
+async def test_amend_unknown_run_is_404(env):
+    assert_error(await env.client.post(amend_url("run-nope"), json={"requirement": "x", "actor": "a"}),
+                 404, "run_not_found")
+
+
+async def test_amend_finished_run_is_409(env):
+    run_id = (await start(env, "plain")).json()["run_id"]
+    r = await env.client.post(amend_url(run_id), json={"requirement": "later", "actor": "alice"})
+    assert_error(r, 409, "run_already_finished")
+    assert (await env.client.get(f"/runs/{run_id}")).json()["requirement"] == "build a thing"
+
+
+@pytest.mark.parametrize("actor", ["auto-approver", "engine", " System "])
+async def test_amend_reserved_actor_is_422(env, actor):
+    run_id, _ = await gated_run(env)
+    assert_error(await env.client.post(amend_url(run_id), json={"requirement": "x y", "actor": actor}),
+                 422, "invalid_actor")
+
+
+async def test_amend_identical_requirement_is_422(env):
+    run_id, _ = await gated_run(env)
+    r = await env.client.post(amend_url(run_id), json={"requirement": " ship a thing ", "actor": "alice"})
+    assert_error(r, 422, "invalid_requirement")
+
+
+@pytest.mark.parametrize("body", [
+    {"requirement": "", "actor": "alice"},
+    {"requirement": "   ", "actor": "alice"},
+    {"requirement": "x" * 2001, "actor": "alice"},
+    {"requirement": "ok", "actor": ""},
+    {"requirement": "ok"},
+    {"actor": "alice"},
+    {"requirement": "ok", "actor": "alice", "comment": "c" * 2001},
+])
+async def test_amend_invalid_bodies_use_the_standard_error_format(env, body):
+    run_id, _ = await gated_run(env)
+    assert_error(await env.client.post(amend_url(run_id), json=body), 422, "validation_error")
+
+
+async def test_amend_policy_violation_is_422_and_leaves_the_run_untouched(env):
+    run_id, approval_id = await gated_run(env)
+    r = await env.client.post(amend_url(run_id), json={
+        "requirement": 'ship it, api_key = "sk-live-1234567890abcdef"', "actor": "alice"})
+    assert_error(r, 422, "policy_violation")
+    assert "sk-live" not in r.text
+    view = (await env.client.get(f"/runs/{run_id}")).json()
+    assert view["requirement"] == "ship a thing" and view["state"] == "waiting_approval"
+    assert [a["id"] for a in view["pending_approvals"]] == [approval_id] and view["stop_requested"] is False
+
+
+async def test_amend_repeated_identical_requests_never_crash_the_run(env):
+    """Two clients send the same amendment at once: one wins, the other is a clean 202/422, the run is not failed."""
+    run_id, _ = await gated_run(env)
+    results = await asyncio.gather(*(env.client.post(amend_url(run_id), json={"requirement": "same new text",
+                                                                              "actor": "alice"}) for _ in range(2)))
+    assert sorted(r.status_code for r in results)[0] == 202
+    await env.supervisor.wait(run_id, WAIT_S)
+    view = (await env.client.get(f"/runs/{run_id}")).json()
+    assert view["state"] == "waiting_approval" and view["requirement"] == "same new text"
+
+
+# ------------------------------------------------- metrics survive a restart
+async def test_default_app_rebuilds_its_metrics_from_the_store_at_startup(tmp_path):
+    """GET /metrics must not restart from zero when the API restarts: stored runs are replayed."""
+    from orchestrator.api import create_default_app
+    from orchestrator.models import RunState
+    from orchestrator.store import SqliteRunStore
+
+    db, audit = str(tmp_path / "api.db"), str(tmp_path / "audit.jsonl")
+    store = SqliteRunStore(db)
+    engine = Engine(AGENTS, store=store, telemetry=Telemetry(), sleep=no_sleep)
+    plain = [await engine.run(engine.create_run("plain", "r", SCENARIOS["plain"].graph).id) for _ in range(2)]
+    gated = await engine.run(engine.create_run("gated", "r", SCENARIOS["gated"].graph).id)
+    broken = await engine.run(engine.create_run("broken", "r", SCENARIOS["broken"].graph).id)
+    never_started = engine.create_run("plain", "r", SCENARIOS["plain"].graph)
+    assert [r.state for r in plain] == [RunState.SUCCEEDED] * 2
+    assert gated.state == RunState.WAITING_APPROVAL and broken.state == RunState.FAILED
+    assert never_started.metrics.started_at is None
+    engine.close()
+    store.close()
+
+    app = create_default_app(db, audit)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as client:
+            snap = (await client.get("/metrics")).json()
+            assert snap["runs_started"] == 4  # the run that never started is not counted
+            assert snap["runs_succeeded"] == 2 and snap["runs_failed"] == 1
+            assert snap["success_rate"] == pytest.approx(2 / 3)
+            assert snap["approvals_requested_total"] == 0  # counted when a run finishes; the paused one is still open
+            assert "orchestrator_runs_started 4" in (await client.get("/metrics", params={"format": "prometheus"})).text
+            assert len((await client.get("/runs")).json()) == 5

@@ -133,6 +133,19 @@ class Telemetry:
                 self._audit = None
 
 
+def replay_runs(telemetry: Any, runs: list[Run]) -> None:
+    """Rebuild the aggregate metrics from stored runs (they are durable, the counters are not).
+
+    Used at API start-up and by the CLI ``metrics`` command, so a restart does not reset ``GET /metrics``.
+    Only runs that actually started count as started; ``run_finished`` ignores runs that are still open, and
+    the event log is NOT replayed (it is an in-memory buffer; the decision lineage on each run is the durable
+    record)."""
+    for run in runs:
+        if run.metrics.started_at is not None:
+            telemetry.run_started(run.id)
+        telemetry.run_finished(run)
+
+
 class NullTelemetry:
     """No-op TelemetrySink for callers that don't want observability."""
 

@@ -51,6 +51,7 @@ def architecture_agent(ctx: AgentContext) -> AgentResult:
         "constraints": MANIFEST["limits"]["known_limitations"],
         "based_on": {"requirements": "normalized_requirements" if "normalized_requirements" in ctx.artifacts
                      else "requirements", "impact": bool(impact)},
+        "generator": "deterministic",
     }
     return AgentResult(artifacts={"architecture": content},
                        summary=f"{len(components)} components, {len(decisions)} decisions for {keys}")

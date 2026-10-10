@@ -16,7 +16,7 @@ def cli(tmp_path, capsys):
         code = main([*argv, "--db", db, "--audit", audit])
         return code, capsys.readouterr()
 
-    run.audit = audit
+    run.audit, run.db = audit, db
     return run
 
 
@@ -147,3 +147,183 @@ def test_resume_refuses_reserved_actor_names(cli):
     rid = run_id(cli("brownfield", "--skip-pytest")[1].out)
     code, cap = cli("resume", rid, "--approve", "api_change_review-1", "--actor", "demo-auto-approver")
     assert code == 2 and "reserved" in cap.err
+
+
+# ---------------------------------------------------------------- amend (re-plan)
+ALIASES = "Extend the URL shortener: add custom aliases for links"
+ALIASES_AND_EXPIRY = "Extend the URL shortener: add custom aliases and expiring links"
+
+
+def paused_at_release(cli):
+    """A brownfield run with its public API change approved, now waiting at the release gate."""
+    rid = run_id(cli("brownfield", "--skip-pytest", "--requirement", ALIASES)[1].out)
+    code, cap = cli("resume", rid, "--approve", "api_change_review-1", "--actor", "alice")
+    assert code == 0 and "release-1" in cap.out
+    return rid
+
+
+def test_amend_shows_which_stages_re_ran_and_which_kept_their_results(cli):
+    rid = paused_at_release(cli)
+    code, cap = cli("amend", rid, "--requirement", ALIASES_AND_EXPIRY, "--actor", "alice", "--comment", "add expiry")
+    assert code == 0, cap.err
+    out = cap.out
+    assert "Requirement amended by alice" in out and f'after:  "{ALIASES_AND_EXPIRY}"' in out
+    assert "RUNS" in out and "RESULT" in out
+    for stage in ("requirements", "impact", "architecture"):
+        assert re.search(rf"^{stage}\s+succeeded\s+1 -> 2\s+re-ran", out, re.M), stage
+    assert re.search(r"^testing\s+succeeded\s+1 -> 1\s+kept", out, re.M)  # nothing it consumes changed
+    assert re.search(r"^api_change_review\s+waiting_approval\s+1 -> 1\s+waiting for approval", out, re.M)
+    # the lineage written by this command, and the approval that must be given again on the new evidence
+    assert "requirement_amended" in out and "requirement amended by alice: add expiry" in out
+    assert re.search(r"approval\s+release\s+cancelled", out)
+    assert "api_change_review-2" in out and "[ttl] POST and PATCH accept ttl_seconds" in out  # the NEW evidence
+    assert "PAUSED" in out and re.search(r"replans=[1-9]", out)
+
+    # the run is really continued from SQLite: approve again, then release again
+    code, cap = cli("resume", rid, "--approve", "api_change_review-2", "--actor", "bob")
+    assert code == 0 and "release-2" in cap.out and "RUNS" in cap.out
+    assert "production_release: withdrawn by engine" in cap.out  # the old release approval, not a human 'no'
+    assert re.search(r"^testing\s+succeeded\s+\d+\s+1\s+1\s", cap.out, re.M)       # kept: one execution in total
+    assert re.search(r"^impl_ttl\s+succeeded\s+\d+\s+1\s+2\s", cap.out, re.M)      # re-ran on the new architecture
+    code, cap = cli("resume", rid, "--approve", "release-2", "--actor", "carol")
+    assert code == 0 and "SUCCEEDED" in cap.out
+
+
+def test_amend_a_run_paused_at_the_first_approval_asks_for_a_fresh_one(cli):
+    rid = run_id(cli("brownfield", "--skip-pytest", "--requirement", ALIASES)[1].out)
+    code, cap = cli("amend", rid, "--requirement", ALIASES_AND_EXPIRY, "--actor", "alice")
+    assert code == 0 and "api_change_review-2" in cap.out
+    assert re.search(r"^impl_alias\s+pending\s+0 -> 0\s+not run yet", cap.out, re.M)
+    code, cap = cli("resume", rid, "--approve", "api_change_review-1", "--actor", "alice")
+    assert code == 2 and "already rejected" in cap.err  # the human's old decision cannot be replayed
+
+
+def test_amend_json_output_is_machine_readable(cli):
+    rid = paused_at_release(cli)
+    code, cap = cli("amend", rid, "--requirement", ALIASES_AND_EXPIRY, "--actor", "alice", "--json")
+    data = json.loads(cap.out)
+    assert code == 0 and data["run_id"] == rid and data["pending_approvals"] == ["api_change_review-2"]
+    amendment = data["amendment"]
+    assert amendment["actor"] == "alice" and amendment["requirement"] == ALIASES_AND_EXPIRY
+    assert amendment["previous_requirement"] == ALIASES
+    results = {s["id"]: s["result"] for s in amendment["stages"]}
+    assert results["requirements"] == "re-ran" and results["testing"].startswith("kept")
+    assert any(d["outcome"] == "requirement_amended" for d in amendment["decisions"])
+    assert data["metrics"]["replans"] >= 1
+
+
+@pytest.mark.parametrize("extra, message", [
+    (["--requirement", ALIASES, "--actor", "alice"], "identical"),
+    (["--requirement", "   ", "--actor", "alice"], "non-empty"),
+    (["--requirement", "x" * 2001, "--actor", "alice"], "limit"),
+    (["--requirement", "new text", "--actor", "auto-approver"], "reserved"),
+    (["--requirement", "new text", "--actor", "engine"], "reserved"),
+])
+def test_amend_refusals_are_clean_errors_with_exit_code_2(cli, extra, message):
+    rid = run_id(cli("brownfield", "--skip-pytest", "--requirement", ALIASES)[1].out)
+    code, cap = cli("amend", rid, *extra)
+    assert code == 2 and message in cap.err and "Traceback" not in cap.err
+    assert ALIASES in cli("status", rid)[1].out  # the requirement is unchanged
+
+
+def test_amend_refuses_policy_violations_without_echoing_the_secret(cli):
+    rid = run_id(cli("brownfield", "--skip-pytest", "--requirement", ALIASES)[1].out)
+    code, cap = cli("amend", rid, "--requirement", 'add aliases, api_key = "sk-live-1234567890abcdef"', "--actor", "alice")
+    assert code == 2 and "policy violation" in cap.err and "sk-live" not in cap.err + cap.out
+    code, cap = cli("status", rid)
+    assert "WAITING_APPROVAL" in cap.out and ALIASES in cap.out  # the run was left as it was
+    code, cap = cli("trace", rid)
+    assert "requirement amendment refused" in cap.out and "sk-live" not in cap.out
+
+
+def test_amend_unknown_and_finished_runs_are_clean_errors(cli):
+    code, cap = cli("amend", "run-deadbeef", "--requirement", "x y z", "--actor", "alice")
+    assert code == 2 and "unknown run" in cap.err
+    rid = run_id(cli("greenfield", "--auto-approve", "--skip-pytest")[1].out)
+    code, cap = cli("amend", rid, "--requirement", "x y z", "--actor", "alice")
+    assert code == 2 and "already succeeded" in cap.err
+
+
+def test_amend_requires_a_requirement():
+    with pytest.raises(SystemExit) as exc:
+        main(["amend", "run-12345678"])
+    assert exc.value.code == 2
+
+
+# ------------------------------------------------- resume hint, --llm, warnings
+def test_resume_hint_repeats_a_custom_db_and_audit_path(cli):
+    code, cap = cli("brownfield", "--skip-pytest")
+    rid = run_id(cap.out)
+    flags = f"--db {cli.db} --audit {cli.audit}"
+    for verb in (f"resume {rid} --approve api_change_review-1 --actor you", f"resume {rid} --reject api_change_review-1 --actor you",
+                 f'amend {rid} --requirement "..." --actor you'):
+        assert f"python -m scenarios {verb} {flags}" in cap.out, verb
+    # the printed command really works against the same files
+    code, cap = cli("status", rid)
+    assert code == 0 and f"--audit {cli.audit}" in cap.out
+
+
+def test_resume_hint_has_no_flags_for_the_default_paths(cli):
+    from orchestrator.store import SqliteRunStore
+    from scenarios.cli import DEFAULT_AUDIT, DEFAULT_DB
+    from scenarios.report import resume_hint
+    rid = run_id(cli("brownfield", "--skip-pytest")[1].out)
+    store = SqliteRunStore(cli.db)
+    try:
+        run = store.load_run(rid)
+    finally:
+        store.close()
+    plain = resume_hint(run, DEFAULT_DB, DEFAULT_DB, DEFAULT_AUDIT, DEFAULT_AUDIT)
+    assert "--db" not in plain and "--audit" not in plain
+    assert "--db" in resume_hint(run, "other.db", DEFAULT_DB, DEFAULT_AUDIT, DEFAULT_AUDIT)
+    spaced = resume_hint(run, "my dir/a.db", DEFAULT_DB, "my dir/a.jsonl", DEFAULT_AUDIT)
+    assert '--db "my dir/a.db" --audit "my dir/a.jsonl"' in spaced
+
+
+def test_llm_flag_is_only_on_the_scenario_commands_and_forces_the_llm_variant(cli, monkeypatch):
+    import scenarios.cli as cli_module
+    seen = []
+    real = cli_module.get_scenario
+
+    def spy(name, llm=None):
+        seen.append(llm)
+        return real(name, llm=False)  # no network: the deterministic scenario, the call itself is what we test
+
+    monkeypatch.setattr(cli_module, "get_scenario", spy)
+    assert cli("greenfield", "--auto-approve", "--skip-pytest")[0] == 0
+    assert cli("greenfield", "--auto-approve", "--skip-pytest", "--llm")[0] == 0
+    assert seen == [None, True]
+    for command in ("resume", "amend", "status"):
+        with pytest.raises(SystemExit):
+            main([command, "run-12345678", "--llm"])
+
+
+def test_llm_flag_is_recorded_as_a_run_param(cli, monkeypatch):
+    import scenarios.cli as cli_module
+    real = cli_module.get_scenario
+    monkeypatch.setattr(cli_module, "get_scenario", lambda name, llm=None: real(name, llm=False))
+    rid = run_id(cli("brownfield", "--skip-pytest", "--llm")[1].out)
+    from orchestrator.store import SqliteRunStore
+    store = SqliteRunStore(cli.db)
+    try:
+        assert store.load_run(rid).params["llm"] is True
+    finally:
+        store.close()
+
+
+def test_cli_prints_no_starlette_deprecation_warning(tmp_path):
+    """`python -m scenarios ...` used to print a StarletteDeprecationWarning (httpx / testclient) on every command."""
+    import subprocess
+    import sys
+
+    from orchestrator.agents.common import PROJECT_ROOT
+    proc = subprocess.run([sys.executable, "-m", "scenarios", "status", "--db", str(tmp_path / "w.db"),
+                           "--audit", str(tmp_path / "w.jsonl")], cwd=PROJECT_ROOT, capture_output=True, text=True,
+                          timeout=120)
+    assert proc.returncode == 0, proc.stderr
+    assert "Deprecat" not in proc.stderr and "Traceback" not in proc.stderr and proc.stderr.strip() == ""
+
+
+def test_status_with_no_runs_prints_just_the_header(cli):
+    code, cap = cli("status")
+    assert code == 0 and "RUN" in cap.out and "PENDING APPROVALS" in cap.out

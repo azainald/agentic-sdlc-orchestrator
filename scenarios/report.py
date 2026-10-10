@@ -8,7 +8,7 @@ from orchestrator.models import ApprovalStatus, Run, StageRuntime
 
 def table(headers: list[str], rows: list[list[Any]]) -> str:
     cells = [[str(c) for c in row] for row in rows]
-    widths = [max(len(h), *(len(r[i]) for r in cells)) for i, h in enumerate(headers)]
+    widths = [max([len(h), *(len(r[i]) for r in cells)]) for i, h in enumerate(headers)]  # no rows: headers only
     line = lambda row: "  ".join(c.ljust(w) for c, w in zip(row, widths)).rstrip()  # noqa: E731
     return "\n".join([line(headers), line(["-" * w for w in widths]), *(line(r) for r in cells)])
 
@@ -38,28 +38,64 @@ def _approval_cell(run: Run, stage_id: str) -> str:
     for a in run.approvals.values():
         if a.stage_id == stage_id:
             who = f" by {a.actor}" if a.actor else ""
-            items.append(f"{a.kind}: {a.status.value}{who}")
+            status = a.status.value
+            if a.status == ApprovalStatus.REJECTED and a.actor == "engine":
+                status = "withdrawn"  # cancelled by the engine (amendment / re-plan), not a human 'no'
+            items.append(f"{a.kind}: {status}{who}")
     return "; ".join(items) or "-"
 
 
 def stage_rows(run: Run) -> list[list[Any]]:
+    """One row per stage. A RUNS column (executions, > 1 after a re-plan) appears only for re-planned runs, so the
+    table of an ordinary run is unchanged."""
+    replanned = any(st.runs > 1 for st in run.stages.values())
     rows = []
     for stage_id, st in run.stages.items():
         ms = duration_ms(st)
         tries = f"{st.attempts}" + (" (fallback)" if st.used_fallback else "")
-        rows.append([stage_id, st.state.value, "-" if ms is None else f"{ms:.0f}", tries,
-                     _gate_cell(gate_results(run, stage_id)), _approval_cell(run, stage_id)])
+        row = [stage_id, st.state.value, "-" if ms is None else f"{ms:.0f}", tries,
+               _gate_cell(gate_results(run, stage_id)), _approval_cell(run, stage_id)]
+        if replanned:
+            row.insert(4, st.runs)
+        rows.append(row)
     return rows
+
+
+def stage_headers(run: Run) -> list[str]:
+    headers = ["STAGE", "STATE", "MS", "ATTEMPTS", "GATES (passed/total)", "APPROVAL"]
+    if any(st.runs > 1 for st in run.stages.values()):
+        headers.insert(4, "RUNS")
+    return headers
 
 
 def pending_approvals(run: Run) -> list:
     return [a for a in run.approvals.values() if a.status == ApprovalStatus.PENDING]
 
 
+def generators(run: Run) -> dict[str, str]:
+    """artifact -> who wrote it ('llm:<model>', 'deterministic', 'deterministic (fallback)'), where it is recorded."""
+    found = {}
+    for name, art in run.artifacts.items():
+        who = art.content.get("generator")
+        if who:
+            stage = run.stages.get(art.produced_by)
+            found[name] = f"{who} (fallback)" if stage and stage.used_fallback else who
+    return found
+
+
+def llm_lines(run: Run) -> list[str]:
+    """Banner and provenance, only for runs that opted in to the LLM layer (offline output is unchanged)."""
+    if not run.params.get("llm"):
+        return []
+    who = ", ".join(f"{n}={g}" for n, g in generators(run).items()) or "none yet"
+    return ["LLM layer: ON. LLM proposes; deterministic tools verify; gates and humans decide.",
+            f"Generators: {who}"]
+
+
 def format_run(run: Run) -> str:
     out = [f"Run {run.id}  scenario={run.scenario}  state={run.state.value.upper()}",
-           f'Requirement: "{run.requirement}"', "",
-           table(["STAGE", "STATE", "MS", "ATTEMPTS", "GATES (passed/total)", "APPROVAL"], stage_rows(run))]
+           f'Requirement: "{run.requirement}"', *llm_lines(run), "",
+           table(stage_headers(run), stage_rows(run))]
     failures = [f"  {s.spec.id}: {s.error}" for s in run.stages.values() if s.error]
     if failures:
         out += ["", "Errors:", *failures]
@@ -103,20 +139,39 @@ def review_lines(run: Run, approval) -> list[str]:
     return []
 
 
-def resume_hint(run: Run, db: str, default_db: str) -> str:
-    """Tell the human exactly how to continue a paused run."""
-    db_flag = "" if db == default_db else f" --db {db}"
+def _path_flag(flag: str, path: str, default: str | None) -> str:
+    """' --db <path>' unless it is the default (quoted when it contains spaces)."""
+    if default is None or path == default:
+        return ""
+    return f' {flag} "{path}"' if " " in path else f" {flag} {path}"
+
+
+def resume_hint(run: Run, db: str, default_db: str, audit: str | None = None,
+                default_audit: str | None = None) -> str:
+    """Tell the human exactly how to continue a paused run. A non-default --db and --audit are repeated in every
+    command, otherwise the hint would point at the default store."""
+    db_flag = _path_flag("--db", db, default_db) + _path_flag("--audit", audit or "", default_audit if audit else None)
     lines = []
     for a in pending_approvals(run):
         lines += [f"PAUSED: run {run.id} is waiting for approval '{a.id}' ({a.kind}) at stage '{a.stage_id}'.",
                   *review_lines(run, a),
                   f"  approve: python -m scenarios resume {run.id} --approve {a.id} --actor you{db_flag}",
                   f"  reject:  python -m scenarios resume {run.id} --reject {a.id} --actor you{db_flag}"]
+    if lines:
+        lines.append(f'  amend the requirement instead: python -m scenarios amend {run.id} --requirement "..." '
+                     f"--actor you{db_flag}")
     return "\n".join(lines)
 
 
 def run_summary(run: Run) -> dict[str, Any]:
     """JSON-friendly view for ``--json``."""
+    summary = _summary(run)
+    if run.params.get("llm"):
+        summary["llm"] = {"enabled": True, "generators": generators(run)}
+    return summary
+
+
+def _summary(run: Run) -> dict[str, Any]:
     return {
         "run_id": run.id, "scenario": run.scenario, "state": run.state.value,
         "stages": [{"id": i, "state": s.state.value, "attempts": s.attempts, "used_fallback": s.used_fallback,

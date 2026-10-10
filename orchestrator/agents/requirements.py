@@ -100,6 +100,7 @@ def requirements_agent(ctx: AgentContext) -> AgentResult:
         "open_questions": [{"topic": t, "question": QUESTIONS[t][0], "resolution": ""} for t in topics],
         "detected_features": features,
         "ambiguity": {"is_ambiguous": bool(topics), "vague_terms": vague_terms(text)},
+        "generator": "deterministic",
     }
     return AgentResult(artifacts={"requirements": content},
                        summary=f"{len(features)} feature(s) detected, {len(topics)} open question(s)")
@@ -114,7 +115,8 @@ def normalize_agent(ctx: AgentContext) -> AgentResult:
         _, proposal, rationale, adds = QUESTIONS[q["topic"]]
         questions.append({**q, "resolution": "", "status": "proposed", "proposed_resolution": proposal,
                           "rationale": rationale, "adds_feature": adds})
-    content = {**source, "open_questions": questions, "interpretation_status": "proposed"}
+    content = {**source, "open_questions": questions, "interpretation_status": "proposed",
+               "generator": "deterministic"}
     return AgentResult(artifacts={"normalized_requirements": content},
                        summary=f"proposed interpretations for {len(questions)} question(s); awaiting approval")
 

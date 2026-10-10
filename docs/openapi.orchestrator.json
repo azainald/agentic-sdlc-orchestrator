@@ -486,6 +486,115 @@
         }
       }
     },
+    "/runs/{run_id}/amend": {
+      "post": {
+        "tags": [
+          "runs"
+        ],
+        "summary": "Amend Run",
+        "description": "Change the requirement of a run that is not finished. ``actor`` is mandatory and attributed.\n\nThe new text is length-limited and passes the same policy scan as artifacts. Root stages run again; only\nstages whose consumed artifacts change run again after them; pending approvals are withdrawn and asked\nagain on the new evidence. 404 unknown run, 409 finished or stopping run, 422 bad actor/text/policy.",
+        "operationId": "amend_run_runs__run_id__amend_post",
+        "parameters": [
+          {
+            "name": "run_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Run Id"
+            }
+          },
+          {
+            "name": "wait",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "description": "Block until the run is terminal or waiting for approval",
+              "default": false,
+              "title": "Wait"
+            },
+            "description": "Block until the run is terminal or waiting for approval"
+          },
+          {
+            "name": "timeout",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "number",
+              "maximum": 600,
+              "minimum": 0,
+              "description": "Max seconds to block when wait=true",
+              "default": 30.0,
+              "title": "Timeout"
+            },
+            "description": "Max seconds to block when wait=true"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AmendRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Amendment accepted; the run re-plans in the background",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AmendAccepted"
+                }
+              }
+            }
+          },
+          "200": {
+            "description": "With wait=true: the run once settled (or on timeout)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunView"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown run, approval or scenario",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "State conflict",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Invalid request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/runs/{run_id}/stop": {
       "post": {
         "tags": [
@@ -555,7 +664,7 @@
           "runs"
         ],
         "summary": "Get Trace",
-        "description": "Audit events (telemetry) plus the decision lineage stored on the run.",
+        "description": "Audit events (telemetry) plus the decision lineage stored on the run.\n\nHonesty note: ``events`` comes from the telemetry's in-memory buffer (bounded, lost on restart; the JSONL\naudit file is the durable copy of it). ``decisions`` is persisted with the run and always complete.",
         "operationId": "get_trace_runs__run_id__trace_get",
         "parameters": [
           {
@@ -704,6 +813,71 @@
   },
   "components": {
     "schemas": {
+      "AmendAccepted": {
+        "properties": {
+          "run_id": {
+            "type": "string",
+            "title": "Run Id"
+          },
+          "actor": {
+            "type": "string",
+            "title": "Actor"
+          },
+          "previous_requirement_sha256": {
+            "type": "string",
+            "title": "Previous Requirement Sha256"
+          },
+          "requirement_sha256": {
+            "type": "string",
+            "title": "Requirement Sha256"
+          },
+          "links": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object",
+            "title": "Links"
+          }
+        },
+        "type": "object",
+        "required": [
+          "run_id",
+          "actor",
+          "previous_requirement_sha256",
+          "requirement_sha256",
+          "links"
+        ],
+        "title": "AmendAccepted"
+      },
+      "AmendRequest": {
+        "properties": {
+          "requirement": {
+            "type": "string",
+            "maxLength": 2000,
+            "minLength": 1,
+            "title": "Requirement"
+          },
+          "actor": {
+            "type": "string",
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Actor"
+          },
+          "comment": {
+            "type": "string",
+            "maxLength": 2000,
+            "title": "Comment",
+            "default": ""
+          }
+        },
+        "type": "object",
+        "required": [
+          "requirement",
+          "actor"
+        ],
+        "title": "AmendRequest",
+        "description": "A named human changes the requirement of a run that is not finished (see docs/REPLAN.md)."
+      },
       "Approval": {
         "properties": {
           "id": {
@@ -1691,7 +1865,7 @@
             },
             "type": "array",
             "title": "Events",
-            "description": "Telemetry audit events, in order"
+            "description": "Telemetry audit events, in order. This is a bounded IN-MEMORY buffer: it is empty for runs that finished before the last restart. The durable record is `decisions` (stored on the run)"
           },
           "decisions": {
             "items": {
