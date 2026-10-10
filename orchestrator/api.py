@@ -31,8 +31,10 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from typing_extensions import Annotated
 
 from scenarios.base import Scenario
+from scenarios.common import resolve_llm, with_llm
 
 from .contracts import RunStore, TelemetrySink
+from .llm import get_settings
 from .engine import RunNotAmendable
 from .models import (
     TERMINAL_RUN_STATES,
@@ -414,6 +416,10 @@ async def create_run(body: CreateRunRequest, wait: bool = WaitParam, timeout: fl
         raise ApiError(422, "unknown_scenario", f"unknown scenario '{body.scenario}'; known: {sorted(scenarios)}")
     if "auto_approve" in body.params:  # approvals are human decisions; no client may switch them off
         raise ApiError(422, "auto_approve_not_allowed", "params.auto_approve is not allowed over the API")
+    if body.params.get("llm") and not get_settings().configured:
+        raise ApiError(422, "llm_not_configured", "params.llm needs GEMINI_API_KEY (set it in .env)")
+    if resolve_llm(body.params):  # swap in the LLM-backed graph; deterministic agents stay as fallback
+        scenario = with_llm(scenario)
     try:
         run = ctx.engine.create_run(scenario.name, body.requirement or scenario.requirement, scenario.graph,
                                     {**scenario.params, **body.params})

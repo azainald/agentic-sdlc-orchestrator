@@ -1,4 +1,4 @@
-"""API tests. The app is built around a real Engine with tiny fake agents, an
+﻿"""API tests. The app is built around a real Engine with tiny fake agents, an
 in-memory store and a no-op sleep, so nothing here depends on the real scenarios.
 httpx.AsyncClient + ASGITransport keeps the app on the test's own event loop
 (the engine uses asyncio primitives); lifespan is driven by hand."""
@@ -480,6 +480,26 @@ async def test_client_cannot_enable_auto_approve_through_run_params(env, value):
     r = await start(env, "gated", params={"auto_approve": value})
     assert_error(r, 422, "auto_approve_not_allowed")
     assert (await env.client.get("/runs")).json() == []  # nothing was created
+
+
+async def test_llm_param_without_a_configured_key_is_422(env, monkeypatch):
+    from orchestrator.llm.config import LLMSettings
+    monkeypatch.setattr("orchestrator.api.get_settings", lambda: LLMSettings(provider="gemini", api_key=None, enabled=False))
+    r = await start(env, "plain", params={"llm": True})
+    assert_error(r, 422, "llm_not_configured")
+    assert (await env.client.get("/runs")).json() == []  # nothing was created
+
+
+async def test_llm_param_with_a_key_swaps_in_the_llm_graph(env, monkeypatch):
+    from orchestrator.llm.config import LLMSettings
+    monkeypatch.setattr("orchestrator.api.get_settings", lambda: LLMSettings(provider="gemini", api_key="fake-key", enabled=True))
+    seen = {}
+    monkeypatch.setattr("orchestrator.api.with_llm", lambda sc: seen.setdefault("called", sc.model_copy(
+        update={"params": {**sc.params, "llm": True}})))
+    r = await start(env, "plain", wait=False, params={"llm": True})
+    assert r.status_code == 202 and "called" in seen
+    view = (await env.client.get(f"/runs/{r.json()['run_id']}")).json()
+    assert view["params"]["llm"] is True
 
 
 async def test_gated_run_still_waits_for_a_human_and_params_do_not_leak_auto_approval(env):
